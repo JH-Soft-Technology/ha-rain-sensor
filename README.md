@@ -40,4 +40,10 @@ It is using mqtt protocol to brings data from hardware into the digital world. t
 
 - When you turn on the Wemos D1 mini, a new rain sensor device in the MQTT integration will automatically appear.
 
+![HA MATT discovery](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/MQTT-discovery-device-rain-sensor.png)
+  
+- Can be used
+
+![HA dashboard](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/HA-lovelace-panel.png)
+
 [![buy me a coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/jhoralek)
