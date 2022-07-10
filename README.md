@@ -16,3 +16,5 @@ amount of water precipitation through mqtt to home assistant using mqtt discover
 ## Environment
 
 It is using mqtt protocol to brings data from hardware into the digital world. tailor-made for the [home assistant](https://www.home-assistant.io/) environment.
+
+[![buy me a coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/jhoralek)
