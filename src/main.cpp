@@ -18,7 +18,7 @@
 #include <ArduinoJson.h>
 
 #define MODEL "rainy 0.0.1"
-#define SW_VERSION "0.0.1"
+#define SW_VERSION "0.0.2"
 
 #define WIFI_SSID "{SSID}"
 #define WIFI_PWD "{SSID PWD}"
@@ -30,7 +30,7 @@
 // if you do not have set up user and pwd, just leave blank
 #define MQTT_USER_NAME "{Broker user name (optional)}" // change to your mqtt user name when you have user name set up
 #define MQTT_PASSWORD "{Broker pwd (optional)}"        // change to your mqtt password when you have pwd set up
-#define MQTT_SEND_INTERVAL 60                          // in seconds
+#define MQTT_SEND_INTERVAL 600                         // in seconds 600=10 min.
 
 #define TOPIC_SENSOR_UNIQUE_ID "rain_sensor" // change to your needs will be unique id of the device
 #define TOPIC_SENSOR_NAME "Rain sensor"
