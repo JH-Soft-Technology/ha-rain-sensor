@@ -17,31 +17,41 @@
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 
-#define MODEL "rainy 0.0.1"
-#define SW_VERSION "0.0.2"
+#define MODEL "rainy 0.0.2"
+#define SW_VERSION "0.0.3"
 
 #define WIFI_SSID "{SSID}"
-#define WIFI_PWD "{SSID PWD}"
+#define WIFI_PWD "{PASSWORD}"
 
 #define MQTT_MAX_TRANSFER_SIZE 512
-#define MQTT_INSTANCE_NAME "ha-rain-sensor"
-#define MQTT_HOST "{MQTT Broker HOST/IP}" // change to your mqtt borer host
-#define MQTT_PORT 1883                    // change to your mqtt broker port
+#define MQTT_INSTANCE_NAME "ha-rain-distance-sensor"
+#define MQTT_HOST "{HOST IP}" // change to your mqtt borer host
+#define MQTT_PORT 1883        // change to your mqtt broker port
 // if you do not have set up user and pwd, just leave blank
-#define MQTT_USER_NAME "{Broker user name (optional)}" // change to your mqtt user name when you have user name set up
-#define MQTT_PASSWORD "{Broker pwd (optional)}"        // change to your mqtt password when you have pwd set up
-#define MQTT_SEND_INTERVAL 600                         // in seconds 600=10 min.
+#define MQTT_USER_NAME "{MQTT USER NAME}" // change to your mqtt user name when you have user name set up
+#define MQTT_PASSWORD "{MQTT PASSWORD}"   // change to your mqtt password when you have pwd set up
+#define MQTT_RAIN_SEND_INTERVAL 600       // in seconds 600=10 min.
+#define MQTT_DISTANCE_SEND_INTERVAL 60    // 1 min. interval
 
-#define TOPIC_SENSOR_UNIQUE_ID "rain_sensor" // change to your needs will be unique id of the device
-#define TOPIC_SENSOR_NAME "Rain sensor"
 #define TOPIC_PREFIX "homeassistant/sensor"
-#define TOPIC_CONFIG TOPIC_PREFIX "/" TOPIC_SENSOR_UNIQUE_ID "/config"
-#define TOPIC_STATE TOPIC_PREFIX "/" TOPIC_SENSOR_UNIQUE_ID "/state"
+
+#define TOPIC_RAIN_SENSOR_UNIQUE_ID "rain_sensor" // change to your needs will be unique i8d of the device
+#define TOPIC_RAIN_SENSOR_NAME "Rain sensor"
+#define TOPIC_RAIN_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_RAIN_SENSOR_UNIQUE_ID "/config"
+#define TOPIC_RAIN_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_RAIN_SENSOR_UNIQUE_ID "/state"
+
+#define TOPIC_DISTANCE_SENSOR_UNIQUE_ID "distance_sensor" // change to your needs will be uniqeu id of the device
+#define TOPIC_DISTANCE_SENSOR_NAME "Distance sensor"
+#define TOPIC_DISTANCE_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/config"
+#define TOPIC_DISTANCE_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/state"
 
 // very important. If you are using Wemos D1 mini, then there is no
 // interrupting supported. You need to use D1 PIN. It is verified
-const byte RAIN_PIN = 5; // D1
-const String mqtt_name = "ha-rain-sensor";
+const byte RAIN_PIN = D1;
+
+// distance sensor pin setup
+const byte ECHO_PIN = D7;
+const byte TRIG_PIN = D6;
 
 WiFiClient wifi;
 PubSubClient mqtt(wifi); // define mqtt client for publishing
@@ -49,7 +59,9 @@ PubSubClient mqtt(wifi); // define mqtt client for publishing
 int wifi_status = WL_IDLE_STATUS;
 
 unsigned int tipping_count = 0; // count bucket woter tipping
-unsigned long last_send;
+unsigned long last_send_rain, last_send_distance;
+
+long duration, distance; // Duration used to calcualte distance
 
 /*
   Initialization WiFi connection
@@ -87,24 +99,54 @@ void connect_to_wifi()
 
   @return String with JSON format data to define device in HA
 */
-DynamicJsonDocument define_config_ha_device()
+DynamicJsonDocument define_config_rain_sensor_to_ha_device()
 {
   DynamicJsonDocument config(1024);
   DynamicJsonDocument device(1024);
 
-  device["identifiers"] = "[" + String(TOPIC_SENSOR_UNIQUE_ID) + "]";
-  device["manufacturer"] = "JH SOFT Technology";
-  device["model"] = MODEL;
-  device["name"] = TOPIC_SENSOR_UNIQUE_ID;
-  device["sw_version"] = SW_VERSION;
+  device["ids"] = "[" + String(MQTT_INSTANCE_NAME) + "]";
+  device["mf"] = "JH SOFT Technology";
+  device["mdl"] = MODEL;
+  device["name"] = TOPIC_RAIN_SENSOR_UNIQUE_ID;
+  device["sw"] = SW_VERSION;
 
-  config["~"] = "homeassistant/sensor/" + String(TOPIC_SENSOR_UNIQUE_ID);
-  config["name"] = TOPIC_SENSOR_NAME;
-  config["unique_id"] = TOPIC_SENSOR_UNIQUE_ID;
+  config["~"] = "homeassistant/sensor/" + String(TOPIC_RAIN_SENSOR_UNIQUE_ID);
+  config["name"] = TOPIC_RAIN_SENSOR_NAME;
+  config["uniq_id"] = TOPIC_RAIN_SENSOR_UNIQUE_ID;
   config["stat_t"] = "~/state";
   config["schema"] = "json";
   config["unit_of_meas"] = "mm";
   config["icon"] = "mdi:weather-rainy";
+  config["pl_avail"] = "online";      // payload_available
+  config["pl_not_avail"] = "offline"; // payload_not_available
+  config["dev"] = device;
+
+  return config;
+}
+
+/**
+ * @brief Definition of distance sensor in HA
+ *
+ * @return DynamicJsonDocument  JSON format string
+ */
+DynamicJsonDocument define_config_distance_sensor_to_ha_device()
+{
+  DynamicJsonDocument config(1024);
+  DynamicJsonDocument device(1024);
+
+  device["identifiers"] = "[" + String(MQTT_INSTANCE_NAME) + "]";
+  device["mf"] = "JH SOFT Technology";
+  device["mdl"] = MODEL;
+  device["name"] = TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
+  device["sw"] = SW_VERSION;
+
+  config["~"] = "homeassistant/sensor/" + String(TOPIC_DISTANCE_SENSOR_UNIQUE_ID);
+  config["name"] = TOPIC_DISTANCE_SENSOR_NAME;
+  config["uniq_id"] = TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
+  config["stat_t"] = "~/state";
+  config["schema"] = "json";
+  config["unit_of_meas"] = "cm";
+  config["icon"] = "mdi:car";
   config["pl_avail"] = "online";      // payload_available
   config["pl_not_avail"] = "offline"; // payload_not_available
   config["dev"] = device;
@@ -123,8 +165,6 @@ boolean send(char *payload, char *topic, boolean retain)
   if (mqtt.connected())
   {
     Serial.println("Already connected into the mqtt broker.");
-
-    last_send = millis();
     return mqtt.publish(topic, payload, retain);
   }
   else
@@ -150,8 +190,6 @@ boolean send(char *payload, char *topic, boolean retain)
     if (connected)
     {
       Serial.println(". connected");
-
-      last_send = millis();
       return mqtt.publish(topic, payload, retain);
     }
   }
@@ -173,7 +211,7 @@ boolean send_config_topic(DynamicJsonDocument payload, String topic)
   char c_topic[topic.length() + 1];
   strcpy(c_topic, topic.c_str());
 
-  return send(c_buffer, c_topic, false);
+  return send(c_buffer, c_topic, true);
 }
 
 /*
@@ -200,8 +238,10 @@ void count_tipping()
 {
   if (digitalRead(RAIN_PIN) == HIGH)
   {
-    Serial.println("tipping");
     tipping_count++;
+
+    Serial.print("tipping: ");
+    Serial.println(tipping_count);
     delay(500);
   }
 }
@@ -219,6 +259,30 @@ float calculate_rain()
   return r;
 }
 
+/**
+ * @brief Will meausre distance between sensor and objects
+ *
+ * @return int Value is in cm
+ */
+long measure_distance()
+{
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH);
+  // Calculate  the distance in cm based on the speed of sound.
+  distance = duration / 58.2;
+
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+
+  return distance;
+}
+
 /*
   Setup app
 */
@@ -227,6 +291,10 @@ void setup()
   Serial.begin(115200);
 
   pinMode(RAIN_PIN, INPUT);
+
+  pinMode(ECHO_PIN, INPUT);  // comment if you dont have distance sensor
+  pinMode(TRIG_PIN, OUTPUT); // comment if you dont have distance sensor
+
   delay(1000);
   connect_to_wifi();
 
@@ -234,10 +302,24 @@ void setup()
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   // neccessary to encrese buffer size for pyload messages
   mqtt.setBufferSize(MQTT_MAX_TRANSFER_SIZE);
-  // send config topic
-  send_config_topic(define_config_ha_device(), TOPIC_CONFIG);
+  // send config topic for rain sensor
+  if (send_config_topic(define_config_rain_sensor_to_ha_device(), TOPIC_RAIN_SENSOR_CONFIG))
+  {
+    Serial.print("Config for ");
+    Serial.print(TOPIC_RAIN_SENSOR_CONFIG);
+    Serial.println(" hs been send successffully");
+  }
+  // comment if you dont have distance sensor
+  // send config topic for distance sensor
+  if (send_config_topic(define_config_distance_sensor_to_ha_device(), TOPIC_DISTANCE_SENSOR_CONFIG))
+  {
+    Serial.print("Config for ");
+    Serial.print(TOPIC_DISTANCE_SENSOR_CONFIG);
+    Serial.println(" hs been send successffully");
+  }
 
-  last_send = millis() - MQTT_SEND_INTERVAL * 1000;
+  last_send_rain = millis() - MQTT_RAIN_SEND_INTERVAL * 1000;
+  last_send_distance = millis() - MQTT_DISTANCE_SEND_INTERVAL * 1000; // comment if you dont have distance sensor
 }
 
 /*
@@ -245,22 +327,39 @@ void setup()
 */
 void loop()
 {
+  measure_distance();
+  delay(50); // need to delay because of the calculation
+
   count_tipping();
 
-  if (millis() - last_send > MQTT_SEND_INTERVAL * 1000)
+  if (WiFi.status() != WL_CONNECTED)
   {
-    if (WiFi.status() != WL_CONNECTED)
+    WiFi.begin(WIFI_SSID, WIFI_PWD);
+    while (WiFi.status() != WL_CONNECTED)
     {
-      WiFi.begin(WIFI_SSID, WIFI_PWD);
-      while (WiFi.status() != WL_CONNECTED)
-      {
-        delay(500);
-      }
-      send_state_topic(calculate_rain(), TOPIC_STATE);
+      delay(500);
     }
-    else
+  }
+  // comment if you dont have distance sensor
+  if (millis() - last_send_distance > MQTT_DISTANCE_SEND_INTERVAL * 1000)
+  {
+    if (WiFi.status() == WL_CONNECTED)
     {
-      send_state_topic(calculate_rain(), TOPIC_STATE);
+      if (send_state_topic(measure_distance(), TOPIC_DISTANCE_SENSOR_STATE))
+      {
+        last_send_distance = millis();
+      }
+    }
+  }
+
+  if (millis() - last_send_rain > MQTT_RAIN_SEND_INTERVAL * 1000)
+  {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      if (send_state_topic(calculate_rain(), TOPIC_RAIN_SENSOR_STATE))
+      {
+        last_send_rain = millis();
+      }
     }
   }
 }
