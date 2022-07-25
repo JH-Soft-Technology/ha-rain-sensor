@@ -20,18 +20,18 @@
 #define MODEL "rainy 0.0.2"
 #define SW_VERSION "0.0.3"
 
-#define WIFI_SSID "ufo"
-#define WIFI_PWD "Porsche356"
+#define WIFI_SSID "{SSID}"
+#define WIFI_PWD "{PASSWORD}"
 
 #define MQTT_MAX_TRANSFER_SIZE 512
 #define MQTT_INSTANCE_NAME "ha-rain-distance-sensor"
-#define MQTT_HOST "192.168.2.5" // change to your mqtt borer host
-#define MQTT_PORT 1883          // change to your mqtt broker port
+#define MQTT_HOST "{HOST IP}" // change to your mqtt borer host
+#define MQTT_PORT 1883        // change to your mqtt broker port
 // if you do not have set up user and pwd, just leave blank
-#define MQTT_USER_NAME "ufo"           // change to your mqtt user name when you have user name set up
-#define MQTT_PASSWORD "ufo356ufo"      // change to your mqtt password when you have pwd set up
-#define MQTT_RAIN_SEND_INTERVAL 600    // in seconds 600=10 min.
-#define MQTT_DISTANCE_SEND_INTERVAL 60 // 1 min. interval
+#define MQTT_USER_NAME "{MQTT USER NAME}" // change to your mqtt user name when you have user name set up
+#define MQTT_PASSWORD "{MQTT PASSWORD}"   // change to your mqtt password when you have pwd set up
+#define MQTT_RAIN_SEND_INTERVAL 600       // in seconds 600=10 min.
+#define MQTT_DISTANCE_SEND_INTERVAL 60    // 1 min. interval
 
 #define TOPIC_PREFIX "homeassistant/sensor"
 
@@ -124,6 +124,11 @@ DynamicJsonDocument define_config_rain_sensor_to_ha_device()
   return config;
 }
 
+/**
+ * @brief Definition of distance sensor in HA
+ *
+ * @return DynamicJsonDocument  JSON format string
+ */
 DynamicJsonDocument define_config_distance_sensor_to_ha_device()
 {
   DynamicJsonDocument config(1024);
@@ -287,8 +292,8 @@ void setup()
 
   pinMode(RAIN_PIN, INPUT);
 
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);  // comment if you dont have distance sensor
+  pinMode(TRIG_PIN, OUTPUT); // comment if you dont have distance sensor
 
   delay(1000);
   connect_to_wifi();
@@ -304,6 +309,7 @@ void setup()
     Serial.print(TOPIC_RAIN_SENSOR_CONFIG);
     Serial.println(" hs been send successffully");
   }
+  // comment if you dont have distance sensor
   // send config topic for distance sensor
   if (send_config_topic(define_config_distance_sensor_to_ha_device(), TOPIC_DISTANCE_SENSOR_CONFIG))
   {
@@ -313,7 +319,7 @@ void setup()
   }
 
   last_send_rain = millis() - MQTT_RAIN_SEND_INTERVAL * 1000;
-  last_send_distance = millis() - MQTT_DISTANCE_SEND_INTERVAL * 1000;
+  last_send_distance = millis() - MQTT_DISTANCE_SEND_INTERVAL * 1000; // comment if you dont have distance sensor
 }
 
 /*
@@ -334,7 +340,7 @@ void loop()
       delay(500);
     }
   }
-
+  // comment if you dont have distance sensor
   if (millis() - last_send_distance > MQTT_DISTANCE_SEND_INTERVAL * 1000)
   {
     if (WiFi.status() == WL_CONNECTED)
