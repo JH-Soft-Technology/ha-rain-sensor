@@ -253,7 +253,7 @@ void count_tipping()
 */
 float calculate_rain()
 {
-  float r = (tipping_count / 2) * 0.2794;
+  float r = (tipping_count ) * 0.2794;
   tipping_count = 0;
 
   return r;
