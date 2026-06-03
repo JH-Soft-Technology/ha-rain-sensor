@@ -42,17 +42,48 @@ recommended:
 For a short cable next to the board the internal `INPUT_PULLUP` plus the
 software debounce is usually enough.
 
-## Home Assistant and sketch setup
+## First-time setup (captive portal)
+
+No credentials are stored in the source code. WiFi and MQTT are configured
+through a captive portal on first boot:
 
 1. Install the [MQTT](https://www.home-assistant.io/integrations/mqtt/) integration in Home Assistant and configure the broker.
-2. Copy `include/secrets.example.h` to `include/secrets.h` and fill in your WiFi and MQTT credentials.
-3. Build and flash the firmware via PlatformIO.
-4. When you turn on the Wemos D1 mini, a new rain sensor device will automatically appear in the MQTT integration.
+2. Build and flash the firmware via PlatformIO (4 MB board, `littlefs` filesystem).
+3. On first boot the device opens a WiFi access point named **`RainSensor-Setup`**.
+   Connect to it with a phone or laptop.
+4. In the portal, pick your WiFi network, enter its password, and fill in the
+   MQTT host, port, user and password. Save.
+5. The device reboots, connects, and a new rain sensor device appears in the
+   MQTT integration automatically.
 
-The sensor reports **cumulative rainfall in mm** (`state_class: total_increasing`).
-Home Assistant automatically tracks resets (after a reboot) and calculates
-hourly / daily / monthly statistics. Use a `utility_meter` helper if you want
-per-day or per-week resets in the dashboard.
+The settings are stored on the device (LittleFS), so they survive reboots and
+firmware updates.
+
+## Web interface and OTA updates
+
+Once connected, the device serves a small web UI on its IP address (shown in the
+serial log and your router):
+
+- `/` — live status: total rain, rate, raining, WiFi signal, IP, uptime, free memory, MQTT state
+- `/update` — upload a new firmware `.bin` straight from the browser (ElegantOTA)
+- `/resetwifi` — clear WiFi settings and reopen the setup portal
+
+## Entities exposed in Home Assistant
+
+All values are sent in a single JSON message and split into entities via value templates:
+
+| Entity | Type | Notes |
+|---|---|---|
+| Rain | sensor (mm) | cumulative, `state_class: total_increasing` |
+| Rain rate | sensor (mm/h) | `device_class: precipitation_intensity` |
+| Raining | binary_sensor | on while it rained in the last 6 min |
+| WiFi signal | sensor (dBm) | diagnostic |
+| Uptime | sensor (s) | diagnostic |
+| Free memory | sensor (B) | diagnostic |
+
+The cumulative rain uses `total_increasing`, so Home Assistant automatically
+tracks resets (after a reboot) and calculates hourly / daily / monthly
+statistics. Use a `utility_meter` helper for per-day or per-week resets.
 
 The send interval adapts automatically: **every 60 s** while it is raining,
 **every 30 min** after 20 minutes without rain.
