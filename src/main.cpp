@@ -45,8 +45,8 @@
 #define TOPIC_DISTANCE_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/config"
 #define TOPIC_DISTANCE_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/state"
 
-// very important. If you are using Wemos D1 mini, then there is no
-// interrupting supported. You need to use D1 PIN. It is verified
+// On the Wemos D1 mini (ESP8266) all GPIO pins except D0 (GPIO16)
+// support hardware interrupts, so D1 works fine with attachInterrupt.
 const byte RAIN_PIN = D1;
 
 // distance sensor pin setup
@@ -58,8 +58,13 @@ PubSubClient mqtt(wifi); // define mqtt client for publishing
 
 int wifi_status = WL_IDLE_STATUS;
 
-unsigned int tipping_count = 0; // count bucket woter tipping
+volatile unsigned int tipping_count = 0; // count bucket water tipping (volatile - modified in ISR)
+volatile unsigned long last_tip_time = 0; // timestamp of last counted tip (for debounce)
 unsigned long last_send_rain, last_send_distance;
+
+// Debounce window for the reed switch (ms). A real tip cannot occur
+// faster than this; anything sooner is contact bounce and is ignored.
+#define DEBOUNCE_MS 150
 
 long duration, distance; // Duration used to calcualte distance
 
@@ -232,31 +237,43 @@ boolean send_state_topic(float state, String topic)
 }
 
 /*
-  Increment tipping from the bucket
+  Interrupt Service Routine (ISR) - called automatically on every
+  tip of the bucket. The MS-WH-SP-RG uses a reed switch that closes
+  to GND, so we trigger on the FALLING edge (HIGH->LOW).
+
+  A software debounce (DEBOUNCE_MS) filters out the mechanical
+  contact bounce of the reed switch. No delay() is used here because
+  blocking calls are not allowed inside an ISR.
+
+  IRAM_ATTR places the routine in IRAM so it runs reliably on ESP8266.
 */
-void count_tipping()
+IRAM_ATTR void count_tipping()
 {
-  if (digitalRead(RAIN_PIN) == HIGH)
+  unsigned long now = millis();
+  if (now - last_tip_time > DEBOUNCE_MS)
   {
     tipping_count++;
-
-    Serial.print("tipping: ");
-    Serial.println(tipping_count);
-    delay(500);
+    last_tip_time = now;
   }
 }
 
 /*
-  Will calculate watter tipping in mm
+  Will calculate water tipping in mm.
+
+  Reads and resets the counter atomically (interrupts disabled for the
+  shortest possible time) so that a tip arriving exactly during the
+  read-reset is not lost.
 
   @return float number of mm
 */
 float calculate_rain()
 {
-  float r = (tipping_count ) * 0.2794;
+  noInterrupts();
+  unsigned int count = tipping_count;
   tipping_count = 0;
+  interrupts();
 
-  return r;
+  return count * 0.2794;
 }
 
 /**
@@ -290,7 +307,11 @@ void setup()
 {
   Serial.begin(115200);
 
-  pinMode(RAIN_PIN, INPUT);
+  // Reed switch closes to GND -> use internal pull-up and trigger on
+  // the FALLING edge. Using an interrupt guarantees no tip is missed,
+  // even during heavy rain when loop() is busy with other work.
+  pinMode(RAIN_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RAIN_PIN), count_tipping, FALLING);
 
   pinMode(ECHO_PIN, INPUT);  // comment if you dont have distance sensor
   pinMode(TRIG_PIN, OUTPUT); // comment if you dont have distance sensor
@@ -330,7 +351,8 @@ void loop()
   measure_distance();
   delay(50); // need to delay because of the calculation
 
-  count_tipping();
+  // Rain tipping is now counted automatically via the hardware
+  // interrupt (see count_tipping ISR), so it is no longer polled here.
 
   if (WiFi.status() != WL_CONNECTED)
   {
