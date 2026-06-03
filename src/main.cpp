@@ -1,46 +1,52 @@
 /*
-  Rain sensor for Home assistant based on mqtt discovery.
+  Rain sensor for Home Assistant based on MQTT discovery.
 
-  Will automatically create device with sensor, only when
-  Mqtt discovery integration is configured
+  Will automatically create a device with sensor(s), as long as the
+  MQTT discovery integration is configured in Home Assistant.
 
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.0.1
-  last change: 10.07.2022
+  version: 0.1.0
+  last change: 03.06.2026
 */
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <ESP8266WiFi.h>
-#include <DNSServer.h>
-#include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 
+// Secrets (WiFi + MQTT credentials) live in a separate, git-ignored
+// header. Copy include/secrets.example.h to include/secrets.h and fill
+// in your own values before building.
+#include "secrets.h"
+
 #define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.0.3"
+#define SW_VERSION "0.1.0"
 
-#define WIFI_SSID "{SSID}"
-#define WIFI_PWD "{PASSWORD}"
-
-#define MQTT_MAX_TRANSFER_SIZE 512
+#define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME "ha-rain-distance-sensor"
-#define MQTT_HOST "{HOST IP}" // change to your mqtt borer host
-#define MQTT_PORT 1883        // change to your mqtt broker port
-// if you do not have set up user and pwd, just leave blank
-#define MQTT_USER_NAME "{MQTT USER NAME}" // change to your mqtt user name when you have user name set up
-#define MQTT_PASSWORD "{MQTT PASSWORD}"   // change to your mqtt password when you have pwd set up
-#define MQTT_RAIN_SEND_INTERVAL 600       // in seconds 600=10 min.
-#define MQTT_DISTANCE_SEND_INTERVAL 60    // 1 min. interval
+#define MQTT_RAIN_SEND_INTERVAL 600    // in seconds 600 = 10 min.
+#define MQTT_DISTANCE_SEND_INTERVAL 60 // 1 min. interval
+
+// How long (ms) to wait for WiFi / MQTT before giving up the current
+// attempt. Nothing blocks forever any more: if a connection cannot be
+// established the loop simply tries again on the next iteration.
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+#define MQTT_RECONNECT_INTERVAL_MS 5000
 
 #define TOPIC_PREFIX "homeassistant/sensor"
 
-#define TOPIC_RAIN_SENSOR_UNIQUE_ID "rain_sensor" // change to your needs will be unique i8d of the device
+// Shared availability topic for the whole device (used by LWT).
+#define TOPIC_AVAILABILITY TOPIC_PREFIX "/" MQTT_INSTANCE_NAME "/availability"
+#define PAYLOAD_ONLINE "online"
+#define PAYLOAD_OFFLINE "offline"
+
+#define TOPIC_RAIN_SENSOR_UNIQUE_ID "rain_sensor" // unique id of the entity
 #define TOPIC_RAIN_SENSOR_NAME "Rain sensor"
 #define TOPIC_RAIN_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_RAIN_SENSOR_UNIQUE_ID "/config"
 #define TOPIC_RAIN_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_RAIN_SENSOR_UNIQUE_ID "/state"
 
-#define TOPIC_DISTANCE_SENSOR_UNIQUE_ID "distance_sensor" // change to your needs will be uniqeu id of the device
+#define TOPIC_DISTANCE_SENSOR_UNIQUE_ID "distance_sensor" // unique id of the entity
 #define TOPIC_DISTANCE_SENSOR_NAME "Distance sensor"
 #define TOPIC_DISTANCE_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/config"
 #define TOPIC_DISTANCE_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/state"
@@ -53,197 +59,31 @@ const byte RAIN_PIN = D1;
 const byte ECHO_PIN = D7;
 const byte TRIG_PIN = D6;
 
+// Rain gauge calibration: the MS-WH-SP-RG tips once per 0.2794 mm of rain.
+const float MM_PER_TIP = 0.2794;
+
 WiFiClient wifi;
-PubSubClient mqtt(wifi); // define mqtt client for publishing
+PubSubClient mqtt(wifi); // mqtt client for publishing
 
-int wifi_status = WL_IDLE_STATUS;
+volatile unsigned int tipping_count = 0;  // bucket tips (volatile - modified in ISR)
+volatile unsigned long last_tip_time = 0; // timestamp of last counted tip (debounce)
 
-volatile unsigned int tipping_count = 0; // count bucket water tipping (volatile - modified in ISR)
-volatile unsigned long last_tip_time = 0; // timestamp of last counted tip (for debounce)
-unsigned long last_send_rain, last_send_distance;
+unsigned long last_send_rain = 0;
+unsigned long last_send_distance = 0;
+unsigned long last_mqtt_attempt = 0;
 
 // Debounce window for the reed switch (ms). A real tip cannot occur
 // faster than this; anything sooner is contact bounce and is ignored.
 #define DEBOUNCE_MS 150
 
-long duration, distance; // Duration used to calcualte distance
-
 /*
-  Initialization WiFi connection
-*/
-void connect_to_wifi()
-{
-  Serial.print("Connecting to Wifi [");
-  Serial.print(WIFI_SSID);
-  Serial.print("] network .");
+  Interrupt Service Routine (ISR) - called automatically on every tip
+  of the bucket. The MS-WH-SP-RG uses a reed switch that closes to GND,
+  so we trigger on the FALLING edge (HIGH->LOW).
 
-  WiFi.begin(WIFI_SSID, WIFI_PWD);
-  WiFi.mode(WIFI_STA); // wifi mode STA 1
-
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    // waiting for connection
-    delay(500);
-    Serial.print(".");
-  }
-
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
-
-  wifi_status = WiFi.status();
-
-  Serial.println(" connected");
-}
-
-/*
-  This method define json object which is tailor-made
-  for home assistant mqtt discovery.
-
-  Will automatically create device with sensor to
-  measure rain
-
-  @return String with JSON format data to define device in HA
-*/
-DynamicJsonDocument define_config_rain_sensor_to_ha_device()
-{
-  DynamicJsonDocument config(1024);
-  DynamicJsonDocument device(1024);
-
-  device["ids"] = "[" + String(MQTT_INSTANCE_NAME) + "]";
-  device["mf"] = "JH SOFT Technology";
-  device["mdl"] = MODEL;
-  device["name"] = TOPIC_RAIN_SENSOR_UNIQUE_ID;
-  device["sw"] = SW_VERSION;
-
-  config["~"] = "homeassistant/sensor/" + String(TOPIC_RAIN_SENSOR_UNIQUE_ID);
-  config["name"] = TOPIC_RAIN_SENSOR_NAME;
-  config["uniq_id"] = TOPIC_RAIN_SENSOR_UNIQUE_ID;
-  config["stat_t"] = "~/state";
-  config["schema"] = "json";
-  config["unit_of_meas"] = "mm";
-  config["icon"] = "mdi:weather-rainy";
-  config["pl_avail"] = "online";      // payload_available
-  config["pl_not_avail"] = "offline"; // payload_not_available
-  config["dev"] = device;
-
-  return config;
-}
-
-/**
- * @brief Definition of distance sensor in HA
- *
- * @return DynamicJsonDocument  JSON format string
- */
-DynamicJsonDocument define_config_distance_sensor_to_ha_device()
-{
-  DynamicJsonDocument config(1024);
-  DynamicJsonDocument device(1024);
-
-  device["identifiers"] = "[" + String(MQTT_INSTANCE_NAME) + "]";
-  device["mf"] = "JH SOFT Technology";
-  device["mdl"] = MODEL;
-  device["name"] = TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
-  device["sw"] = SW_VERSION;
-
-  config["~"] = "homeassistant/sensor/" + String(TOPIC_DISTANCE_SENSOR_UNIQUE_ID);
-  config["name"] = TOPIC_DISTANCE_SENSOR_NAME;
-  config["uniq_id"] = TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
-  config["stat_t"] = "~/state";
-  config["schema"] = "json";
-  config["unit_of_meas"] = "cm";
-  config["icon"] = "mdi:car";
-  config["pl_avail"] = "online";      // payload_available
-  config["pl_not_avail"] = "offline"; // payload_not_available
-  config["dev"] = device;
-
-  return config;
-}
-
-/*
-  Will send topic with payload into the broker
-
-  @param payload - message (data)
-  @param topic - it is address where data will be stored
-*/
-boolean send(char *payload, char *topic, boolean retain)
-{
-  if (mqtt.connected())
-  {
-    Serial.println("Already connected into the mqtt broker.");
-    return mqtt.publish(topic, payload, retain);
-  }
-  else
-  {
-    Serial.print("Connecting to mqtt broker .");
-  }
-
-  while (!mqtt.connected())
-  {
-    Serial.print(".");
-
-    boolean connected = false;
-
-    if (strlen(MQTT_USER_NAME) > 0 && strlen(MQTT_PASSWORD) > 0)
-    {
-      connected = mqtt.connect(MQTT_INSTANCE_NAME, MQTT_USER_NAME, MQTT_PASSWORD);
-    }
-    else
-    {
-      connected = mqtt.connect(MQTT_INSTANCE_NAME);
-    }
-
-    if (connected)
-    {
-      Serial.println(". connected");
-      return mqtt.publish(topic, payload, retain);
-    }
-  }
-
-  return false;
-}
-
-/*
-  Will publish data into specific topic
-
-  @param topic - specific address where will be placed data in mqtt broker
-  @param payload - data in JSON format
-*/
-boolean send_config_topic(DynamicJsonDocument payload, String topic)
-{
-  char c_buffer[MQTT_MAX_TRANSFER_SIZE];
-  serializeJson(payload, c_buffer);
-
-  char c_topic[topic.length() + 1];
-  strcpy(c_topic, topic.c_str());
-
-  return send(c_buffer, c_topic, true);
-}
-
-/*
-  Will publish state data from rain sensor into the HA device
-
-  @param state - is a float number of watter tipped in mm
-  @param topic - is a topic where should be data sent
- */
-boolean send_state_topic(float state, String topic)
-{
-  char s_buffer[sizeof(state)];
-  sprintf(s_buffer, "%.2f", state);
-
-  char c_topic[topic.length() + 1];
-  strcpy(c_topic, topic.c_str());
-
-  return send(s_buffer, c_topic, true);
-}
-
-/*
-  Interrupt Service Routine (ISR) - called automatically on every
-  tip of the bucket. The MS-WH-SP-RG uses a reed switch that closes
-  to GND, so we trigger on the FALLING edge (HIGH->LOW).
-
-  A software debounce (DEBOUNCE_MS) filters out the mechanical
-  contact bounce of the reed switch. No delay() is used here because
-  blocking calls are not allowed inside an ISR.
+  A software debounce (DEBOUNCE_MS) filters out the mechanical contact
+  bounce of the reed switch. No delay() is used here because blocking
+  calls are not allowed inside an ISR.
 
   IRAM_ATTR places the routine in IRAM so it runs reliably on ESP8266.
 */
@@ -258,29 +98,243 @@ IRAM_ATTR void count_tipping()
 }
 
 /*
-  Will calculate water tipping in mm.
+  Initialize / (re)establish the WiFi connection.
 
-  Reads and resets the counter atomically (interrupts disabled for the
-  shortest possible time) so that a tip arriving exactly during the
-  read-reset is not lost.
+  Non-blocking with a timeout: if the connection is not up within
+  WIFI_CONNECT_TIMEOUT_MS the function returns false and the caller can
+  simply try again later instead of hanging forever.
 
-  @return float number of mm
+  @return true if connected
 */
-float calculate_rain()
+boolean connect_to_wifi()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    return true;
+  }
+
+  Serial.print("Connecting to Wifi [");
+  Serial.print(WIFI_SSID);
+  Serial.print("] network .");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PWD);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    if (millis() - start > WIFI_CONNECT_TIMEOUT_MS)
+    {
+      Serial.println(" timeout");
+      return false;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println(" connected");
+  return true;
+}
+
+/*
+  Fill a Home Assistant "device" object so that both entities are
+  grouped under one device. identifiers must be a JSON array.
+*/
+void add_device_info(JsonObject device)
+{
+  JsonArray ids = device.createNestedArray("ids"); // identifiers
+  ids.add(MQTT_INSTANCE_NAME);
+  device["mf"] = "JH SOFT Technology"; // manufacturer
+  device["mdl"] = MODEL;               // model
+  device["name"] = "Rain & distance sensor";
+  device["sw"] = SW_VERSION; // software version
+}
+
+/*
+  Build the MQTT discovery config for the rain sensor.
+
+  @return DynamicJsonDocument with the discovery payload
+*/
+DynamicJsonDocument define_config_rain_sensor_to_ha_device()
+{
+  DynamicJsonDocument config(1024);
+
+  config["~"] = "homeassistant/sensor/" TOPIC_RAIN_SENSOR_UNIQUE_ID;
+  config["name"] = TOPIC_RAIN_SENSOR_NAME;
+  config["uniq_id"] = TOPIC_RAIN_SENSOR_UNIQUE_ID;
+  config["stat_t"] = "~/state";
+  config["unit_of_meas"] = "mm";
+  config["dev_cla"] = "precipitation"; // device_class
+  config["stat_cla"] = "measurement";  // state_class
+  config["icon"] = "mdi:weather-rainy";
+  config["avty_t"] = TOPIC_AVAILABILITY; // availability_topic
+  config["pl_avail"] = PAYLOAD_ONLINE;
+  config["pl_not_avail"] = PAYLOAD_OFFLINE;
+
+  add_device_info(config.createNestedObject("dev"));
+
+  return config;
+}
+
+/*
+  Build the MQTT discovery config for the distance sensor.
+
+  @return DynamicJsonDocument with the discovery payload
+*/
+DynamicJsonDocument define_config_distance_sensor_to_ha_device()
+{
+  DynamicJsonDocument config(1024);
+
+  config["~"] = "homeassistant/sensor/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
+  config["name"] = TOPIC_DISTANCE_SENSOR_NAME;
+  config["uniq_id"] = TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
+  config["stat_t"] = "~/state";
+  config["unit_of_meas"] = "cm";
+  config["dev_cla"] = "distance";     // device_class
+  config["stat_cla"] = "measurement"; // state_class
+  config["icon"] = "mdi:arrow-expand-vertical";
+  config["avty_t"] = TOPIC_AVAILABILITY; // availability_topic
+  config["pl_avail"] = PAYLOAD_ONLINE;
+  config["pl_not_avail"] = PAYLOAD_OFFLINE;
+
+  add_device_info(config.createNestedObject("dev"));
+
+  return config;
+}
+
+/*
+  (Re)connect to the MQTT broker, non-blocking.
+
+  Registers a Last Will & Testament so the broker automatically marks
+  the device "offline" if it drops off the network. On a successful
+  connect it (re)publishes "online" to the availability topic.
+
+  Only one connection attempt is made per call and attempts are rate
+  limited by MQTT_RECONNECT_INTERVAL_MS, so loop() never blocks.
+
+  @return true if connected
+*/
+boolean mqtt_reconnect()
+{
+  if (mqtt.connected())
+  {
+    return true;
+  }
+
+  if (millis() - last_mqtt_attempt < MQTT_RECONNECT_INTERVAL_MS)
+  {
+    return false; // wait before trying again
+  }
+  last_mqtt_attempt = millis();
+
+  Serial.print("Connecting to mqtt broker ...");
+
+  boolean connected;
+  if (strlen(MQTT_USER_NAME) > 0 && strlen(MQTT_PASSWORD) > 0)
+  {
+    connected = mqtt.connect(MQTT_INSTANCE_NAME, MQTT_USER_NAME, MQTT_PASSWORD,
+                             TOPIC_AVAILABILITY, 0, true, PAYLOAD_OFFLINE);
+  }
+  else
+  {
+    connected = mqtt.connect(MQTT_INSTANCE_NAME, NULL, NULL,
+                             TOPIC_AVAILABILITY, 0, true, PAYLOAD_OFFLINE);
+  }
+
+  if (connected)
+  {
+    Serial.println(" connected");
+    // mark the device available and (re)send discovery so HA picks it
+    // up again after a broker restart.
+    mqtt.publish(TOPIC_AVAILABILITY, PAYLOAD_ONLINE, true);
+    return true;
+  }
+
+  Serial.print(" failed, rc=");
+  Serial.println(mqtt.state());
+  return false;
+}
+
+/*
+  Publish a payload to a topic. Ensures the broker connection is up
+  first; if it cannot be established the publish is skipped (no block).
+
+  @return true if published
+*/
+boolean publish(const char *topic, const char *payload, boolean retain)
+{
+  if (!mqtt_reconnect())
+  {
+    return false;
+  }
+  return mqtt.publish(topic, payload, retain);
+}
+
+/*
+  Serialize a discovery config document and publish it (retained).
+
+  @return true if published
+*/
+boolean send_config_topic(DynamicJsonDocument payload, const char *topic)
+{
+  char buffer[MQTT_MAX_TRANSFER_SIZE];
+  size_t n = serializeJson(payload, buffer, sizeof(buffer));
+  if (n == 0)
+  {
+    Serial.println("Config serialization failed (buffer too small)");
+    return false;
+  }
+  return publish(topic, buffer, true);
+}
+
+/*
+  Publish a floating point state value (retained).
+
+  @param state - measured value
+  @param topic - destination topic
+  @return true if published
+*/
+boolean send_state_topic(float state, const char *topic)
+{
+  char buffer[16]; // enough for "%.2f" of any realistic value
+  snprintf(buffer, sizeof(buffer), "%.2f", state);
+  return publish(topic, buffer, true);
+}
+
+/*
+  Read the current tip count without resetting it (atomic).
+
+  @return number of tips accumulated so far
+*/
+unsigned int peek_tips()
 {
   noInterrupts();
   unsigned int count = tipping_count;
-  tipping_count = 0;
   interrupts();
-
-  return count * 0.2794;
+  return count;
 }
 
-/**
- * @brief Will meausre distance between sensor and objects
- *
- * @return int Value is in cm
- */
+/*
+  Atomically subtract the tips that were already reported. We subtract
+  (instead of zeroing) so that tips arriving while the value was being
+  published are preserved for the next interval.
+
+  @param consumed - number of tips that were successfully sent
+*/
+void consume_tips(unsigned int consumed)
+{
+  noInterrupts();
+  tipping_count -= consumed;
+  interrupts();
+}
+
+/*
+  Measure the distance between the ultrasonic sensor and an object.
+
+  @return distance in cm
+*/
 long measure_distance()
 {
   digitalWrite(TRIG_PIN, LOW);
@@ -289,9 +343,9 @@ long measure_distance()
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  duration = pulseIn(ECHO_PIN, HIGH);
-  // Calculate  the distance in cm based on the speed of sound.
-  distance = duration / 58.2;
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  // Calculate the distance in cm based on the speed of sound.
+  long distance = duration / 58.2;
 
   Serial.print("Distance: ");
   Serial.print(distance);
@@ -301,7 +355,7 @@ long measure_distance()
 }
 
 /*
-  Setup app
+  Setup
 */
 void setup()
 {
@@ -319,69 +373,59 @@ void setup()
   delay(1000);
   connect_to_wifi();
 
-  // setup mqtt broker
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  // neccessary to encrese buffer size for pyload messages
+  // increase buffer size so the discovery payload fits
   mqtt.setBufferSize(MQTT_MAX_TRANSFER_SIZE);
-  // send config topic for rain sensor
-  if (send_config_topic(define_config_rain_sensor_to_ha_device(), TOPIC_RAIN_SENSOR_CONFIG))
+
+  // connect and send discovery configs
+  if (mqtt_reconnect())
   {
-    Serial.print("Config for ");
-    Serial.print(TOPIC_RAIN_SENSOR_CONFIG);
-    Serial.println(" hs been send successffully");
-  }
-  // comment if you dont have distance sensor
-  // send config topic for distance sensor
-  if (send_config_topic(define_config_distance_sensor_to_ha_device(), TOPIC_DISTANCE_SENSOR_CONFIG))
-  {
-    Serial.print("Config for ");
-    Serial.print(TOPIC_DISTANCE_SENSOR_CONFIG);
-    Serial.println(" hs been send successffully");
+    if (send_config_topic(define_config_rain_sensor_to_ha_device(), TOPIC_RAIN_SENSOR_CONFIG))
+    {
+      Serial.println("Config for rain sensor sent successfully");
+    }
+    // comment if you dont have distance sensor
+    if (send_config_topic(define_config_distance_sensor_to_ha_device(), TOPIC_DISTANCE_SENSOR_CONFIG))
+    {
+      Serial.println("Config for distance sensor sent successfully");
+    }
   }
 
-  last_send_rain = millis() - MQTT_RAIN_SEND_INTERVAL * 1000;
-  last_send_distance = millis() - MQTT_DISTANCE_SEND_INTERVAL * 1000; // comment if you dont have distance sensor
+  // force a send on the first loop iteration
+  last_send_rain = millis() - MQTT_RAIN_SEND_INTERVAL * 1000UL;
+  last_send_distance = millis() - MQTT_DISTANCE_SEND_INTERVAL * 1000UL; // comment if you dont have distance sensor
 }
 
 /*
-  Here is running program repeatedly
+  Main loop
 */
 void loop()
 {
-  measure_distance();
-  delay(50); // need to delay because of the calculation
-
-  // Rain tipping is now counted automatically via the hardware
-  // interrupt (see count_tipping ISR), so it is no longer polled here.
-
-  if (WiFi.status() != WL_CONNECTED)
+  // keep connections alive (non-blocking)
+  if (!connect_to_wifi())
   {
-    WiFi.begin(WIFI_SSID, WIFI_PWD);
-    while (WiFi.status() != WL_CONNECTED)
-    {
-      delay(500);
-    }
+    return; // no WiFi yet, try again next iteration
   }
-  // comment if you dont have distance sensor
-  if (millis() - last_send_distance > MQTT_DISTANCE_SEND_INTERVAL * 1000)
+  mqtt_reconnect();
+  mqtt.loop();
+
+  // comment this block if you dont have distance sensor
+  if (millis() - last_send_distance > MQTT_DISTANCE_SEND_INTERVAL * 1000UL)
   {
-    if (WiFi.status() == WL_CONNECTED)
+    long distance = measure_distance();
+    if (send_state_topic((float)distance, TOPIC_DISTANCE_SENSOR_STATE))
     {
-      if (send_state_topic(measure_distance(), TOPIC_DISTANCE_SENSOR_STATE))
-      {
-        last_send_distance = millis();
-      }
+      last_send_distance = millis();
     }
   }
 
-  if (millis() - last_send_rain > MQTT_RAIN_SEND_INTERVAL * 1000)
+  if (millis() - last_send_rain > MQTT_RAIN_SEND_INTERVAL * 1000UL)
   {
-    if (WiFi.status() == WL_CONNECTED)
+    unsigned int tips = peek_tips();
+    if (send_state_topic(tips * MM_PER_TIP, TOPIC_RAIN_SENSOR_STATE))
     {
-      if (send_state_topic(calculate_rain(), TOPIC_RAIN_SENSOR_STATE))
-      {
-        last_send_rain = millis();
-      }
+      consume_tips(tips); // only clear what was actually reported
+      last_send_rain = millis();
     }
   }
 }
