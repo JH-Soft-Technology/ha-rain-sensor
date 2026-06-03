@@ -1,7 +1,7 @@
-# Rain senosor
+# Rain sensor
 
-An project which brings alive rain bucket sensor with Wemos D1 mini to measure 
-amount of water precipitation through mqtt to [Home assistant](https://www.home-assistant.io/) using mqtt discovery.
+A project which brings alive a rain bucket sensor with Wemos D1 mini to measure
+amount of water precipitation through MQTT to [Home Assistant](https://www.home-assistant.io/) using MQTT discovery.
 
 ## Used hardware
 
@@ -25,20 +25,12 @@ It is using mqtt protocol to brings data from hardware into the digital world. t
   - [Pipe holder part 2](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/3d_print/rain%20sensor%20tube%20holder%20part%202.stl)
   - [Arm holder](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/3d_print/Rain%20sensor%20arm.stl)
 
-## Wiring 
-
-![Without shield](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/WeMos-d1-connect-to-ms-wh-sp-rg-rain-tipping-sensor.png)
-
-## Wiring with shield
-
-![With shield](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/WeMos-d1-connect-with-shield-to-ms-wh-sp-rg-rain-tipping-sensor.png)
-
-## Recommended input wiring (debounce / noise filtering)
+## Wiring
 
 The rain gauge uses a reed (magnetic) switch on a ~2.9 m cable. The firmware
-already debounces the signal in software, but on a long cable a single noise
-spike can be miscounted as a tip when using interrupts. A simple RC filter on
-the input is recommended:
+debounces the signal in software, but on a long cable a single noise spike can
+be miscounted as a tip when using interrupts. A simple RC filter on the input is
+recommended:
 
 - `10 kΩ` pull-up from D1 to 3V3 (lower impedance than the internal pull-up)
 - `100 nF` capacitor from D1 to GND (RC low-pass that smooths noise spikes)
@@ -52,15 +44,17 @@ software debounce is usually enough.
 
 ## Home Assistant and sketch setup
 
-- Need to configure mqtt-broker. Install it as new integration named [MQTT](https://www.home-assistant.io/integrations/mqtt/) and configure it.
-- Setup the main.cpp file in this project. Setup WiFi connection and point to the MQTT broker installed in HA. 
+1. Install the [MQTT](https://www.home-assistant.io/integrations/mqtt/) integration in Home Assistant and configure the broker.
+2. Copy `include/secrets.example.h` to `include/secrets.h` and fill in your WiFi and MQTT credentials.
+3. Build and flash the firmware via PlatformIO.
+4. When you turn on the Wemos D1 mini, a new rain sensor device will automatically appear in the MQTT integration.
 
-- When you turn on the Wemos D1 mini, a new rain sensor device in the MQTT integration will automatically appear.
+The sensor reports **cumulative rainfall in mm** (`state_class: total_increasing`).
+Home Assistant automatically tracks resets (after a reboot) and calculates
+hourly / daily / monthly statistics. Use a `utility_meter` helper if you want
+per-day or per-week resets in the dashboard.
 
-![HA MATT discovery](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/MQTT-discovery-device-rain-sensor.png)
-  
-- Can be used
-
-![HA dashboard](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/HA-lovelace-panel.png)
+The send interval adapts automatically: **every 60 s** while it is raining,
+**every 30 min** after 20 minutes without rain.
 
 [![buy me a coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/jhoralek)
