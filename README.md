@@ -33,6 +33,23 @@ It is using mqtt protocol to brings data from hardware into the digital world. t
 
 ![With shield](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/WeMos-d1-connect-with-shield-to-ms-wh-sp-rg-rain-tipping-sensor.png)
 
+## Recommended input wiring (debounce / noise filtering)
+
+The rain gauge uses a reed (magnetic) switch on a ~2.9 m cable. The firmware
+already debounces the signal in software, but on a long cable a single noise
+spike can be miscounted as a tip when using interrupts. A simple RC filter on
+the input is recommended:
+
+- `10 kΩ` pull-up from D1 to 3V3 (lower impedance than the internal pull-up)
+- `100 nF` capacitor from D1 to GND (RC low-pass that smooths noise spikes)
+- `1 kΩ` resistor in series with the reed switch (limits the capacitor's
+  discharge current and protects the reed contacts)
+
+![Recommended input wiring](https://github.com/JH-Soft-Technology/ha-rain-sensor/blob/master/content/images/reed-switch-debounce-wiring.png)
+
+For a short cable next to the board the internal `INPUT_PULLUP` plus the
+software debounce is usually enough.
+
 ## Home Assistant and sketch setup
 
 - Need to configure mqtt-broker. Install it as new integration named [MQTT](https://www.home-assistant.io/integrations/mqtt/) and configure it.
