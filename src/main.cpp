@@ -7,7 +7,7 @@
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.2.0
+  version: 0.3.0
   last change: 03.06.2026
 */
 #include <Arduino.h>
@@ -21,11 +21,16 @@
 #include "secrets.h"
 
 #define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.1.0"
+#define SW_VERSION "0.3.0"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
-#define MQTT_INSTANCE_NAME "ha-rain-distance-sensor"
-#define MQTT_RAIN_SEND_INTERVAL 600 // in seconds 600 = 10 min.
+#define MQTT_INSTANCE_NAME "ha-rain-sensor"
+// Adaptive send interval: send more frequently while it is raining so
+// HA graphs have good resolution; drop to a long interval when dry to
+// save bandwidth and broker resources.
+#define RAIN_ACTIVE_INTERVAL_S 60    // every 60 s while raining
+#define RAIN_IDLE_INTERVAL_S 1800    // every 30 min when dry
+#define NO_RAIN_TIMEOUT_MS 1200000UL // 20 min without a tip → idle mode
 
 // How long (ms) to wait for WiFi / MQTT before giving up the current
 // attempt. Nothing blocks forever any more: if a connection cannot be
@@ -60,6 +65,8 @@ volatile unsigned long last_tip_time = 0; // timestamp of last counted tip (debo
 
 unsigned long last_send_rain = 0;
 unsigned long last_mqtt_attempt = 0;
+
+float total_rain_mm = 0.0; // cumulative rainfall since boot (mm)
 
 // Debounce window for the reed switch (ms). A real tip cannot occur
 // faster than this; anything sooner is contact bounce and is ignored.
@@ -155,8 +162,8 @@ DynamicJsonDocument define_config_rain_sensor_to_ha_device()
   config["uniq_id"] = TOPIC_RAIN_SENSOR_UNIQUE_ID;
   config["stat_t"] = "~/state";
   config["unit_of_meas"] = "mm";
-  config["dev_cla"] = "precipitation"; // device_class
-  config["stat_cla"] = "measurement";  // state_class
+  config["dev_cla"] = "precipitation";     // device_class
+  config["stat_cla"] = "total_increasing"; // state_class: HA auto-tracks resets
   config["icon"] = "mdi:weather-rainy";
   config["avty_t"] = TOPIC_AVAILABILITY; // availability_topic
   config["pl_avail"] = PAYLOAD_ONLINE;
@@ -323,7 +330,7 @@ void setup()
   }
 
   // force a send on the first loop iteration
-  last_send_rain = millis() - MQTT_RAIN_SEND_INTERVAL * 1000UL;
+  last_send_rain = millis() - RAIN_ACTIVE_INTERVAL_S * 1000UL;
 }
 
 /*
@@ -339,12 +346,26 @@ void loop()
   mqtt_reconnect();
   mqtt.loop();
 
-  if (millis() - last_send_rain > MQTT_RAIN_SEND_INTERVAL * 1000UL)
+  // Accumulate tips into the running total immediately so they are
+  // never lost, even if a later MQTT publish fails.
+  unsigned int tips = peek_tips();
+  if (tips > 0)
   {
-    unsigned int tips = peek_tips();
-    if (send_state_topic(tips * MM_PER_TIP, TOPIC_RAIN_SENSOR_STATE))
+    consume_tips(tips);
+    total_rain_mm += tips * MM_PER_TIP;
+  }
+
+  // Adaptive interval: frequent updates while it is raining give
+  // high-resolution HA graphs; infrequent updates when dry save
+  // bandwidth and broker resources.
+  unsigned long interval_ms = (millis() - last_tip_time < NO_RAIN_TIMEOUT_MS)
+                                  ? RAIN_ACTIVE_INTERVAL_S * 1000UL
+                                  : RAIN_IDLE_INTERVAL_S * 1000UL;
+
+  if (millis() - last_send_rain > interval_ms)
+  {
+    if (send_state_topic(total_rain_mm, TOPIC_RAIN_SENSOR_STATE))
     {
-      consume_tips(tips); // only clear what was actually reported
       last_send_rain = millis();
     }
   }
