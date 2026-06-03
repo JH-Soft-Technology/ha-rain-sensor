@@ -5,7 +5,7 @@ amount of water precipitation through MQTT to [Home Assistant](https://www.home-
 
 ## Used hardware
 
-- Rain bucket sensor [MS-WH-SP-RG](https://pl.banggood.com/Misol-WH-SP-RG-1PC-Spare-Part-For-Weather-Station-For-Rain-Meter-Measure-Rain-Volume-Rain-Gauge-p-1440220.html?imageAb=1&akmClientCountry=CZ&a=1657088088.4075&cur_warehouse=CN&DCC=CZ&currency=USD&akmClientCountry=CZ)
+- Rain bucket sensor [MS-WH-SP-RG](https://www.laskakit.cz/ms-wh-sp-rg-srazkomer/)
 - [Wemos D1 mini](https://www.banggood.com/Geekcreit-D1-Mini-V2_3_0-WIFI-Internet-Of-Things-Development-Board-Based-ESP8266-ESP-12S-4MB-FLASH-p-1214756.html?cur_warehouse=CN&rmmds=search) development board
 
 ## Dev platform
