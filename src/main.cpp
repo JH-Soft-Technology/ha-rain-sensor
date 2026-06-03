@@ -1,13 +1,13 @@
 /*
   Rain sensor for Home Assistant based on MQTT discovery.
 
-  Will automatically create a device with sensor(s), as long as the
+  Will automatically create a rain sensor device, as long as the
   MQTT discovery integration is configured in Home Assistant.
 
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.1.0
+  version: 0.2.0
   last change: 03.06.2026
 */
 #include <Arduino.h>
@@ -25,8 +25,7 @@
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME "ha-rain-distance-sensor"
-#define MQTT_RAIN_SEND_INTERVAL 600    // in seconds 600 = 10 min.
-#define MQTT_DISTANCE_SEND_INTERVAL 60 // 1 min. interval
+#define MQTT_RAIN_SEND_INTERVAL 600 // in seconds 600 = 10 min.
 
 // How long (ms) to wait for WiFi / MQTT before giving up the current
 // attempt. Nothing blocks forever any more: if a connection cannot be
@@ -46,18 +45,9 @@
 #define TOPIC_RAIN_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_RAIN_SENSOR_UNIQUE_ID "/config"
 #define TOPIC_RAIN_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_RAIN_SENSOR_UNIQUE_ID "/state"
 
-#define TOPIC_DISTANCE_SENSOR_UNIQUE_ID "distance_sensor" // unique id of the entity
-#define TOPIC_DISTANCE_SENSOR_NAME "Distance sensor"
-#define TOPIC_DISTANCE_SENSOR_CONFIG TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/config"
-#define TOPIC_DISTANCE_SENSOR_STATE TOPIC_PREFIX "/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID "/state"
-
 // On the Wemos D1 mini (ESP8266) all GPIO pins except D0 (GPIO16)
 // support hardware interrupts, so D1 works fine with attachInterrupt.
 const byte RAIN_PIN = D1;
-
-// distance sensor pin setup
-const byte ECHO_PIN = D7;
-const byte TRIG_PIN = D6;
 
 // Rain gauge calibration: the MS-WH-SP-RG tips once per 0.2794 mm of rain.
 const float MM_PER_TIP = 0.2794;
@@ -69,7 +59,6 @@ volatile unsigned int tipping_count = 0;  // bucket tips (volatile - modified in
 volatile unsigned long last_tip_time = 0; // timestamp of last counted tip (debounce)
 
 unsigned long last_send_rain = 0;
-unsigned long last_send_distance = 0;
 unsigned long last_mqtt_attempt = 0;
 
 // Debounce window for the reed switch (ms). A real tip cannot occur
@@ -148,7 +137,7 @@ void add_device_info(JsonObject device)
   ids.add(MQTT_INSTANCE_NAME);
   device["mf"] = "JH SOFT Technology"; // manufacturer
   device["mdl"] = MODEL;               // model
-  device["name"] = "Rain & distance sensor";
+  device["name"] = "Rain sensor";
   device["sw"] = SW_VERSION; // software version
 }
 
@@ -169,32 +158,6 @@ DynamicJsonDocument define_config_rain_sensor_to_ha_device()
   config["dev_cla"] = "precipitation"; // device_class
   config["stat_cla"] = "measurement";  // state_class
   config["icon"] = "mdi:weather-rainy";
-  config["avty_t"] = TOPIC_AVAILABILITY; // availability_topic
-  config["pl_avail"] = PAYLOAD_ONLINE;
-  config["pl_not_avail"] = PAYLOAD_OFFLINE;
-
-  add_device_info(config.createNestedObject("dev"));
-
-  return config;
-}
-
-/*
-  Build the MQTT discovery config for the distance sensor.
-
-  @return DynamicJsonDocument with the discovery payload
-*/
-DynamicJsonDocument define_config_distance_sensor_to_ha_device()
-{
-  DynamicJsonDocument config(1024);
-
-  config["~"] = "homeassistant/sensor/" TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
-  config["name"] = TOPIC_DISTANCE_SENSOR_NAME;
-  config["uniq_id"] = TOPIC_DISTANCE_SENSOR_UNIQUE_ID;
-  config["stat_t"] = "~/state";
-  config["unit_of_meas"] = "cm";
-  config["dev_cla"] = "distance";     // device_class
-  config["stat_cla"] = "measurement"; // state_class
-  config["icon"] = "mdi:arrow-expand-vertical";
   config["avty_t"] = TOPIC_AVAILABILITY; // availability_topic
   config["pl_avail"] = PAYLOAD_ONLINE;
   config["pl_not_avail"] = PAYLOAD_OFFLINE;
@@ -331,30 +294,6 @@ void consume_tips(unsigned int consumed)
 }
 
 /*
-  Measure the distance between the ultrasonic sensor and an object.
-
-  @return distance in cm
-*/
-long measure_distance()
-{
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  // Calculate the distance in cm based on the speed of sound.
-  long distance = duration / 58.2;
-
-  Serial.print("Distance: ");
-  Serial.print(distance);
-  Serial.println(" cm");
-
-  return distance;
-}
-
-/*
   Setup
 */
 void setup()
@@ -367,9 +306,6 @@ void setup()
   pinMode(RAIN_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RAIN_PIN), count_tipping, FALLING);
 
-  pinMode(ECHO_PIN, INPUT);  // comment if you dont have distance sensor
-  pinMode(TRIG_PIN, OUTPUT); // comment if you dont have distance sensor
-
   delay(1000);
   connect_to_wifi();
 
@@ -377,23 +313,17 @@ void setup()
   // increase buffer size so the discovery payload fits
   mqtt.setBufferSize(MQTT_MAX_TRANSFER_SIZE);
 
-  // connect and send discovery configs
+  // connect and send discovery config
   if (mqtt_reconnect())
   {
     if (send_config_topic(define_config_rain_sensor_to_ha_device(), TOPIC_RAIN_SENSOR_CONFIG))
     {
       Serial.println("Config for rain sensor sent successfully");
     }
-    // comment if you dont have distance sensor
-    if (send_config_topic(define_config_distance_sensor_to_ha_device(), TOPIC_DISTANCE_SENSOR_CONFIG))
-    {
-      Serial.println("Config for distance sensor sent successfully");
-    }
   }
 
   // force a send on the first loop iteration
   last_send_rain = millis() - MQTT_RAIN_SEND_INTERVAL * 1000UL;
-  last_send_distance = millis() - MQTT_DISTANCE_SEND_INTERVAL * 1000UL; // comment if you dont have distance sensor
 }
 
 /*
@@ -408,16 +338,6 @@ void loop()
   }
   mqtt_reconnect();
   mqtt.loop();
-
-  // comment this block if you dont have distance sensor
-  if (millis() - last_send_distance > MQTT_DISTANCE_SEND_INTERVAL * 1000UL)
-  {
-    long distance = measure_distance();
-    if (send_state_topic((float)distance, TOPIC_DISTANCE_SENSOR_STATE))
-    {
-      last_send_distance = millis();
-    }
-  }
 
   if (millis() - last_send_rain > MQTT_RAIN_SEND_INTERVAL * 1000UL)
   {
