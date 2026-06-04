@@ -4,17 +4,19 @@
   Features:
     - WiFi + MQTT configuration via a captive portal (WiFiManager),
       no credentials are stored in source code.
-    - Web UI with live status, firmware update (ElegantOTA) and a
-      "reset WiFi" button.
+    - Web UI with live status, precipitation period totals, firmware
+      update (ElegantOTA) and a "reset WiFi" button.
+    - NTP time sync (CET/CEST) for daily/weekly/monthly/yearly reset.
+    - Period stats (today/week/month/year) persisted to LittleFS.
     - One JSON state message exposed in HA as several entities:
       cumulative rain (mm), rain rate (mm/h), raining (binary),
-      WiFi RSSI, uptime and free heap.
+      today/week/month/year rain, WiFi RSSI, uptime and free heap.
 
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.4.0
-  last change: 03.06.2026
+  version: 0.6.0
+  last change: 04.06.2026
 */
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -24,154 +26,281 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <ElegantOTA.h>
+#include <time.h>
 
-#define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.4.0"
+#define MODEL      "rainy 0.0.2"
+#define SW_VERSION "0.6.0"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
-#define MQTT_INSTANCE_NAME "ha-rain-sensor"
+#define MQTT_INSTANCE_NAME     "ha-rain-sensor"
 
-// Captive portal access point shown on first boot / after a WiFi reset.
 #define AP_NAME "RainSensor-Setup"
 
-// Adaptive send interval: send frequently while raining for high
-// resolution HA graphs, infrequently when dry to save resources.
-#define RAIN_ACTIVE_INTERVAL_S 60    // every 60 s while raining
-#define RAIN_IDLE_INTERVAL_S 1800    // every 30 min when dry
-#define NO_RAIN_TIMEOUT_MS 1200000UL // 20 min without a tip -> idle mode
-#define RAIN_NOW_WINDOW_MS 360000UL  // "raining" if a tip in last 6 min
+#define RAIN_ACTIVE_INTERVAL_S 60
+#define RAIN_IDLE_INTERVAL_S   1800
+#define NO_RAIN_TIMEOUT_MS     1200000UL
+#define RAIN_NOW_WINDOW_MS     360000UL
 
 #define MQTT_RECONNECT_INTERVAL_MS 5000
-#define DEBOUNCE_MS 150 // reed-switch software debounce
+#define DEBOUNCE_MS                150
+
+#define NTP_SERVER    "pool.ntp.org"
+#define TZ_INFO       "CET-1CEST,M3.5.0,M10.5.0/3"
+#define STATS_SAVE_MS 300000UL  // persist period stats every 5 min
 
 // ---- MQTT discovery topics ----
-#define TOPIC_STATE "homeassistant/sensor/" MQTT_INSTANCE_NAME "/state"
-#define TOPIC_AVAILABILITY "homeassistant/sensor/" MQTT_INSTANCE_NAME "/availability"
-#define PAYLOAD_ONLINE "online"
+#define TOPIC_STATE        "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/state"
+#define TOPIC_AVAILABILITY "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/availability"
+#define PAYLOAD_ONLINE  "online"
 #define PAYLOAD_OFFLINE "offline"
 
-#define CFG_RAIN "homeassistant/sensor/" MQTT_INSTANCE_NAME "/rain/config"
-#define CFG_RATE "homeassistant/sensor/" MQTT_INSTANCE_NAME "/rate/config"
-#define CFG_RSSI "homeassistant/sensor/" MQTT_INSTANCE_NAME "/rssi/config"
-#define CFG_UPTIME "homeassistant/sensor/" MQTT_INSTANCE_NAME "/uptime/config"
-#define CFG_HEAP "homeassistant/sensor/" MQTT_INSTANCE_NAME "/heap/config"
+#define CFG_RAIN    "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/rain/config"
+#define CFG_RATE    "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/rate/config"
+#define CFG_RSSI    "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/rssi/config"
+#define CFG_UPTIME  "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/uptime/config"
+#define CFG_HEAP    "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/heap/config"
 #define CFG_RAINING "homeassistant/binary_sensor/" MQTT_INSTANCE_NAME "/raining/config"
+#define CFG_TODAY   "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/today/config"
+#define CFG_WEEK    "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/week/config"
+#define CFG_MONTH   "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/month/config"
+#define CFG_YEAR    "homeassistant/sensor/"        MQTT_INSTANCE_NAME "/year/config"
 
 // On the Wemos D1 mini (ESP8266) all GPIO pins except D0 (GPIO16)
 // support hardware interrupts, so D1 works fine with attachInterrupt.
-const byte RAIN_PIN = D1;
-
-// Rain gauge calibration: the MS-WH-SP-RG tips once per 0.2794 mm of rain.
+const byte  RAIN_PIN   = D1;
 const float MM_PER_TIP = 0.2794;
 
-// ---- persisted MQTT configuration (saved to LittleFS) ----
-struct Config
-{
+// ---- persisted MQTT configuration ----
+struct Config {
   char host[40];
   char port[6];
   char user[32];
   char pass[32];
 };
 Config config;
-
 bool shouldSaveConfig = false;
 
-WiFiClient wifi;
-PubSubClient mqtt(wifi);
+WiFiClient      wifi;
+PubSubClient    mqtt(wifi);
 ESP8266WebServer server(80);
-WiFiManager wm;
+WiFiManager     wm;
 
-volatile unsigned int tipping_count = 0;  // bucket tips (modified in ISR)
-volatile unsigned long last_tip_time = 0; // last counted tip (debounce + "raining")
+volatile unsigned int  tipping_count = 0;
+volatile unsigned long last_tip_time = 0;
 
-float total_rain_mm = 0.0;  // cumulative rainfall since boot (mm)
-float period_rain_mm = 0.0; // rain since last publish (for rate calc)
-float last_rate = 0.0;      // last computed rate (mm/h), for the web UI
+float total_rain_mm  = 0.0;
+float period_rain_mm = 0.0;
+float last_rate      = 0.0;
 
-unsigned long last_send_rain = 0;
+// Period statistics — reset daily/weekly/monthly/yearly via NTP time
+float rain_today_mm = 0.0;
+float rain_week_mm  = 0.0;
+float rain_month_mm = 0.0;
+float rain_year_mm  = 0.0;
+
+// Reference timestamps stored alongside period stats in LittleFS
+int ref_yday  = -1;  // tm_yday at last save (0–365)
+int ref_week  = -1;  // ISO week number at last save
+int ref_month = -1;  // tm_mon at last save (0–11)
+int ref_year  = -1;  // tm_year at last save (years since 1900)
+
+// Per-bucket history arrays for in-tile sparkline charts
+float rain_hourly[24]      = {};  // rain per hour of today     (index = tm_hour)
+float rain_daily_week[7]   = {};  // rain per weekday Mon–Sun   (index = (wday+6)%7)
+float rain_daily_month[31] = {};  // rain per day of month      (index = tm_mday-1)
+float rain_monthly[12]     = {};  // rain per month of year     (index = tm_mon)
+
+int hist_hour = -1;  // current accumulation bucket indices (updated each minute)
+int hist_wday = -1;
+int hist_mday = -1;
+int hist_mon  = -1;
+
+unsigned long last_send_rain    = 0;
 unsigned long last_mqtt_attempt = 0;
+unsigned long last_stats_save   = 0;
+unsigned long last_rollover_chk = 0;
 
-/*
-  ISR - counts a bucket tip. The MS-WH-SP-RG reed switch closes to GND,
-  so we trigger on the FALLING edge. A software debounce filters out
-  contact bounce. No delay() because this runs in interrupt context.
-*/
+// ---- ISR + tip helpers ----
+
 IRAM_ATTR void count_tipping()
 {
   unsigned long now = millis();
-  if (now - last_tip_time > DEBOUNCE_MS)
-  {
+  if (now - last_tip_time > DEBOUNCE_MS) {
     tipping_count++;
     last_tip_time = now;
   }
 }
 
-/*
-  Read the current tip count without resetting it (atomic).
-*/
 unsigned int peek_tips()
 {
   noInterrupts();
-  unsigned int count = tipping_count;
+  unsigned int c = tipping_count;
   interrupts();
-  return count;
+  return c;
 }
 
-/*
-  Atomically subtract the tips that were already accounted for. We
-  subtract (instead of zeroing) so tips arriving during processing are
-  preserved.
-*/
-void consume_tips(unsigned int consumed)
+void consume_tips(unsigned int n)
 {
   noInterrupts();
-  tipping_count -= consumed;
+  tipping_count -= n;
   interrupts();
 }
 
-/*
-  True if a tip occurred recently (used for the binary "raining" entity).
-*/
 boolean raining_now()
 {
   return (millis() - last_tip_time) < RAIN_NOW_WINDOW_MS;
 }
 
-// ---------------------------------------------------------------------
-//  Configuration persistence (LittleFS)
-// ---------------------------------------------------------------------
+// ---- Time helpers ----
 
-/*
-  Load the MQTT config from /config.json. Returns false if missing.
-*/
-boolean load_config()
+boolean get_localtime(struct tm &ti)
 {
-  if (!LittleFS.exists("/config.json"))
-  {
-    return false;
-  }
-  File f = LittleFS.open("/config.json", "r");
-  if (!f)
-  {
-    return false;
-  }
-  DynamicJsonDocument doc(512);
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-  if (err)
-  {
-    return false;
-  }
-  strlcpy(config.host, doc["host"] | "", sizeof(config.host));
-  strlcpy(config.port, doc["port"] | "1883", sizeof(config.port));
-  strlcpy(config.user, doc["user"] | "", sizeof(config.user));
-  strlcpy(config.pass, doc["pass"] | "", sizeof(config.pass));
+  time_t now = time(nullptr);
+  if (now < 1000000000UL) return false;
+  localtime_r(&now, &ti);
   return true;
 }
 
-/*
-  Save the MQTT config to /config.json.
-*/
+// Monday-based ISO week number (strftime %W).
+int week_num(const struct tm &ti)
+{
+  char buf[4];
+  strftime(buf, sizeof(buf), "%W", &ti);
+  return atoi(buf);
+}
+
+void sync_ntp()
+{
+  configTime(0, 0, NTP_SERVER);
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
+  Serial.print("Waiting for NTP ...");
+  time_t now = 0;
+  for (int i = 0; i < 50 && now < 1000000000UL; i++) {
+    delay(100);
+    time(&now);
+  }
+  Serial.println(now > 1000000000UL ? " OK" : " failed");
+}
+
+// ---- Period-stats persistence (LittleFS /stats.json) ----
+
+void load_stats()
+{
+  if (!LittleFS.exists("/stats.json")) return;
+  File f = LittleFS.open("/stats.json", "r");
+  if (!f) return;
+  DynamicJsonDocument doc(256);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  f.close();
+  rain_today_mm = doc["today"] | 0.0f;
+  rain_week_mm  = doc["week"]  | 0.0f;
+  rain_month_mm = doc["month"] | 0.0f;
+  rain_year_mm  = doc["yr"]    | 0.0f;
+  ref_yday  = doc["yday"] | -1;
+  ref_week  = doc["wk"]   | -1;
+  ref_month = doc["mon"]  | -1;
+  ref_year  = doc["year"] | -1;
+}
+
+void save_stats()
+{
+  DynamicJsonDocument doc(256);
+  doc["today"] = rain_today_mm;
+  doc["week"]  = rain_week_mm;
+  doc["month"] = rain_month_mm;
+  doc["yr"]    = rain_year_mm;
+  doc["yday"]  = ref_yday;
+  doc["wk"]    = ref_week;
+  doc["mon"]   = ref_month;
+  doc["year"]  = ref_year;
+  File f = LittleFS.open("/stats.json", "w");
+  if (!f) return;
+  serializeJson(doc, f);
+  f.close();
+}
+
+void save_history();  // defined below, forward-declared for check_rollover
+
+// Reset period accumulators that have rolled over since the last save.
+void check_rollover()
+{
+  struct tm ti;
+  if (!get_localtime(ti)) return;
+
+  int cur_yday  = ti.tm_yday;
+  int cur_week  = week_num(ti);
+  int cur_month = ti.tm_mon;
+  int cur_year  = ti.tm_year;
+
+  // Always keep current-bucket indices up to date
+  hist_hour = ti.tm_hour;
+  hist_wday = (ti.tm_wday + 6) % 7;  // Mon=0 … Sun=6
+  hist_mday = ti.tm_mday - 1;
+  hist_mon  = ti.tm_mon;
+
+  if (ref_year == -1) {
+    ref_yday = cur_yday; ref_week  = cur_week;
+    ref_month = cur_month; ref_year = cur_year;
+    save_stats();
+    return;
+  }
+
+  bool changed = false;
+
+  if (cur_year != ref_year) {
+    rain_year_mm = rain_month_mm = rain_week_mm = rain_today_mm = 0;
+    memset(rain_monthly,      0, sizeof(rain_monthly));
+    memset(rain_daily_month,  0, sizeof(rain_daily_month));
+    memset(rain_daily_week,   0, sizeof(rain_daily_week));
+    memset(rain_hourly,       0, sizeof(rain_hourly));
+    ref_year = cur_year; ref_month = cur_month;
+    ref_week = cur_week; ref_yday  = cur_yday;
+    changed = true;
+  } else if (cur_month != ref_month) {
+    rain_month_mm = rain_week_mm = rain_today_mm = 0;
+    memset(rain_daily_month,  0, sizeof(rain_daily_month));
+    memset(rain_daily_week,   0, sizeof(rain_daily_week));
+    memset(rain_hourly,       0, sizeof(rain_hourly));
+    ref_month = cur_month; ref_week = cur_week; ref_yday = cur_yday;
+    changed = true;
+  } else if (cur_week != ref_week) {
+    rain_week_mm = rain_today_mm = 0;
+    memset(rain_daily_week,   0, sizeof(rain_daily_week));
+    memset(rain_hourly,       0, sizeof(rain_hourly));
+    ref_week = cur_week; ref_yday = cur_yday;
+    changed = true;
+  } else if (cur_yday != ref_yday) {
+    rain_today_mm = 0;
+    memset(rain_hourly,       0, sizeof(rain_hourly));
+    ref_yday = cur_yday;
+    changed = true;
+  }
+
+  if (changed) {
+    save_stats();
+    save_history();
+  }
+}
+
+// ---- MQTT configuration persistence (LittleFS /config.json) ----
+
+boolean load_config()
+{
+  if (!LittleFS.exists("/config.json")) return false;
+  File f = LittleFS.open("/config.json", "r");
+  if (!f) return false;
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return false;
+  strlcpy(config.host, doc["host"] | "",     sizeof(config.host));
+  strlcpy(config.port, doc["port"] | "1883", sizeof(config.port));
+  strlcpy(config.user, doc["user"] | "",     sizeof(config.user));
+  strlcpy(config.pass, doc["pass"] | "",     sizeof(config.pass));
+  return true;
+}
+
 void save_config()
 {
   DynamicJsonDocument doc(512);
@@ -179,304 +308,617 @@ void save_config()
   doc["port"] = config.port;
   doc["user"] = config.user;
   doc["pass"] = config.pass;
-
   File f = LittleFS.open("/config.json", "w");
-  if (!f)
-  {
-    Serial.println("Failed to open config file for writing");
-    return;
-  }
+  if (!f) { Serial.println("Failed to open config file for writing"); return; }
   serializeJson(doc, f);
   f.close();
   Serial.println("Config saved");
 }
 
-void save_config_callback()
+void load_history()
 {
-  shouldSaveConfig = true;
+  if (!LittleFS.exists("/history.json")) return;
+  File f = LittleFS.open("/history.json", "r");
+  if (!f) return;
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, f)) { f.close(); return; }
+  f.close();
+  JsonArray ah = doc["h"].as<JsonArray>();
+  JsonArray aw = doc["w"].as<JsonArray>();
+  JsonArray am = doc["m"].as<JsonArray>();
+  JsonArray ay = doc["y"].as<JsonArray>();
+  for (int i = 0; i < (int)ah.size() && i < 24; i++) rain_hourly[i]      = ah[i] | 0.0f;
+  for (int i = 0; i < (int)aw.size() && i < 7;  i++) rain_daily_week[i]  = aw[i] | 0.0f;
+  for (int i = 0; i < (int)am.size() && i < 31; i++) rain_daily_month[i] = am[i] | 0.0f;
+  for (int i = 0; i < (int)ay.size() && i < 12; i++) rain_monthly[i]     = ay[i] | 0.0f;
 }
 
-// ---------------------------------------------------------------------
-//  Home Assistant MQTT discovery
-// ---------------------------------------------------------------------
+void save_history()
+{
+  DynamicJsonDocument doc(1024);
+  JsonArray ah = doc.createNestedArray("h");
+  JsonArray aw = doc.createNestedArray("w");
+  JsonArray am = doc.createNestedArray("m");
+  JsonArray ay = doc.createNestedArray("y");
+  for (int i = 0; i < 24; i++) ah.add(round(rain_hourly[i]      * 100) / 100.0f);
+  for (int i = 0; i < 7;  i++) aw.add(round(rain_daily_week[i]  * 100) / 100.0f);
+  for (int i = 0; i < 31; i++) am.add(round(rain_daily_month[i] * 100) / 100.0f);
+  for (int i = 0; i < 12; i++) ay.add(round(rain_monthly[i]     * 100) / 100.0f);
+  File f = LittleFS.open("/history.json", "w");
+  if (!f) return;
+  serializeJson(doc, f);
+  f.close();
+}
 
-/*
-  Fill a HA "device" object so all entities are grouped under one device.
-*/
+void save_config_callback() { shouldSaveConfig = true; }
+
+// ---- Home Assistant MQTT discovery ----
+
 void add_device_info(JsonObject device)
 {
   JsonArray ids = device.createNestedArray("ids");
   ids.add(MQTT_INSTANCE_NAME);
-  device["mf"] = "JH SOFT Technology";
-  device["mdl"] = MODEL;
+  device["mf"]   = "JH SOFT Technology";
+  device["mdl"]  = MODEL;
   device["name"] = "Rain sensor";
-  device["sw"] = SW_VERSION;
+  device["sw"]   = SW_VERSION;
 }
 
-/*
-  Build a generic sensor discovery config that reads one field from the
-  shared JSON state topic via a value template.
-*/
 DynamicJsonDocument build_sensor_config(const char *name, const char *uniq,
                                         const char *val_tpl, const char *unit,
                                         const char *dev_cla, const char *stat_cla,
                                         const char *icon, boolean diagnostic)
 {
   DynamicJsonDocument c(1024);
-  c["name"] = name;
+  c["name"]    = name;
   c["uniq_id"] = uniq;
-  c["stat_t"] = TOPIC_STATE;
+  c["stat_t"]  = TOPIC_STATE;
   c["val_tpl"] = val_tpl;
-  if (unit)
-    c["unit_of_meas"] = unit;
-  if (dev_cla)
-    c["dev_cla"] = dev_cla;
-  if (stat_cla)
-    c["stat_cla"] = stat_cla;
-  if (icon)
-    c["icon"] = icon;
-  if (diagnostic)
-    c["ent_cat"] = "diagnostic";
-  c["avty_t"] = TOPIC_AVAILABILITY;
-  c["pl_avail"] = PAYLOAD_ONLINE;
+  if (unit)       c["unit_of_meas"] = unit;
+  if (dev_cla)    c["dev_cla"]      = dev_cla;
+  if (stat_cla)   c["stat_cla"]     = stat_cla;
+  if (icon)       c["icon"]         = icon;
+  if (diagnostic) c["ent_cat"]      = "diagnostic";
+  c["avty_t"]       = TOPIC_AVAILABILITY;
+  c["pl_avail"]     = PAYLOAD_ONLINE;
   c["pl_not_avail"] = PAYLOAD_OFFLINE;
   add_device_info(c.createNestedObject("dev"));
   return c;
 }
 
-/*
-  Build the binary "raining" discovery config.
-*/
 DynamicJsonDocument build_raining_config()
 {
   DynamicJsonDocument c(1024);
-  c["name"] = "Raining";
+  c["name"]    = "Raining";
   c["uniq_id"] = "rain_sensor_raining";
-  c["stat_t"] = TOPIC_STATE;
+  c["stat_t"]  = TOPIC_STATE;
   c["val_tpl"] = "{{ 'ON' if value_json.raining else 'OFF' }}";
   c["dev_cla"] = "moisture";
-  c["icon"] = "mdi:weather-pouring";
-  c["avty_t"] = TOPIC_AVAILABILITY;
-  c["pl_avail"] = PAYLOAD_ONLINE;
+  c["icon"]    = "mdi:weather-pouring";
+  c["avty_t"]       = TOPIC_AVAILABILITY;
+  c["pl_avail"]     = PAYLOAD_ONLINE;
   c["pl_not_avail"] = PAYLOAD_OFFLINE;
   add_device_info(c.createNestedObject("dev"));
   return c;
 }
 
-// ---------------------------------------------------------------------
-//  MQTT
-// ---------------------------------------------------------------------
+// ---- MQTT ----
 
-/*
-  (Re)connect to the MQTT broker, non-blocking. Registers a Last Will so
-  the broker marks the device offline if it drops. Publishes discovery
-  and "online" on a successful (re)connect.
-*/
 boolean mqtt_reconnect()
 {
-  if (mqtt.connected())
-  {
-    return true;
-  }
-  if (millis() - last_mqtt_attempt < MQTT_RECONNECT_INTERVAL_MS)
-  {
-    return false;
-  }
+  if (mqtt.connected()) return true;
+  if (millis() - last_mqtt_attempt < MQTT_RECONNECT_INTERVAL_MS) return false;
   last_mqtt_attempt = millis();
-
   Serial.print("Connecting to mqtt broker ...");
-
   boolean connected;
   if (strlen(config.user) > 0)
-  {
     connected = mqtt.connect(MQTT_INSTANCE_NAME, config.user, config.pass,
                              TOPIC_AVAILABILITY, 0, true, PAYLOAD_OFFLINE);
-  }
   else
-  {
     connected = mqtt.connect(MQTT_INSTANCE_NAME, NULL, NULL,
                              TOPIC_AVAILABILITY, 0, true, PAYLOAD_OFFLINE);
-  }
-
-  if (!connected)
-  {
-    Serial.print(" failed, rc=");
-    Serial.println(mqtt.state());
+  if (!connected) {
+    Serial.print(" failed, rc="); Serial.println(mqtt.state());
     return false;
   }
-
   Serial.println(" connected");
   mqtt.publish(TOPIC_AVAILABILITY, PAYLOAD_ONLINE, true);
   return true;
 }
 
-/*
-  Serialize a discovery document and publish it (retained).
-*/
 boolean publish_config(DynamicJsonDocument doc, const char *topic)
 {
   char buffer[MQTT_MAX_TRANSFER_SIZE];
   size_t n = serializeJson(doc, buffer, sizeof(buffer));
-  if (n == 0)
-  {
-    Serial.println("Config serialization failed (buffer too small)");
-    return false;
-  }
+  if (!n) { Serial.println("Config serialization failed (buffer too small)"); return false; }
   return mqtt.publish(topic, buffer, true);
 }
 
-/*
-  Publish all discovery configs for the device's entities.
-*/
 void publish_discovery()
 {
-  publish_config(build_sensor_config("Rain", "rain_sensor",
-                                     "{{ value_json.rain }}", "mm",
-                                     "precipitation", "total_increasing",
-                                     "mdi:weather-rainy", false),
-                 CFG_RAIN);
-  publish_config(build_sensor_config("Rain rate", "rain_sensor_rate",
-                                     "{{ value_json.rate }}", "mm/h",
-                                     "precipitation_intensity", "measurement",
-                                     "mdi:weather-pouring", false),
-                 CFG_RATE);
-  publish_config(build_sensor_config("WiFi signal", "rain_sensor_rssi",
-                                     "{{ value_json.rssi }}", "dBm",
-                                     "signal_strength", "measurement",
-                                     NULL, true),
-                 CFG_RSSI);
-  publish_config(build_sensor_config("Uptime", "rain_sensor_uptime",
-                                     "{{ value_json.uptime }}", "s",
-                                     "duration", "measurement",
-                                     NULL, true),
-                 CFG_UPTIME);
-  publish_config(build_sensor_config("Free memory", "rain_sensor_heap",
-                                     "{{ value_json.heap }}", "B",
-                                     NULL, "measurement",
-                                     "mdi:memory", true),
-                 CFG_HEAP);
+  publish_config(build_sensor_config(
+    "Rain", "rain_sensor",
+    "{{ value_json.rain }}", "mm",
+    "precipitation", "total_increasing", "mdi:weather-rainy", false), CFG_RAIN);
+
+  publish_config(build_sensor_config(
+    "Rain rate", "rain_sensor_rate",
+    "{{ value_json.rate }}", "mm/h",
+    "precipitation_intensity", "measurement", "mdi:weather-pouring", false), CFG_RATE);
+
+  publish_config(build_sensor_config(
+    "Rain today", "rain_sensor_today",
+    "{{ value_json.today }}", "mm",
+    "precipitation", "measurement", "mdi:weather-rainy", false), CFG_TODAY);
+
+  publish_config(build_sensor_config(
+    "Rain this week", "rain_sensor_week",
+    "{{ value_json.week }}", "mm",
+    "precipitation", "measurement", "mdi:calendar-week", false), CFG_WEEK);
+
+  publish_config(build_sensor_config(
+    "Rain this month", "rain_sensor_month",
+    "{{ value_json.month }}", "mm",
+    "precipitation", "measurement", "mdi:calendar-month", false), CFG_MONTH);
+
+  publish_config(build_sensor_config(
+    "Rain this year", "rain_sensor_year",
+    "{{ value_json.year }}", "mm",
+    "precipitation", "measurement", "mdi:calendar", false), CFG_YEAR);
+
+  publish_config(build_sensor_config(
+    "WiFi signal", "rain_sensor_rssi",
+    "{{ value_json.rssi }}", "dBm",
+    "signal_strength", "measurement", NULL, true), CFG_RSSI);
+
+  publish_config(build_sensor_config(
+    "Uptime", "rain_sensor_uptime",
+    "{{ value_json.uptime }}", "s",
+    "duration", "measurement", NULL, true), CFG_UPTIME);
+
+  publish_config(build_sensor_config(
+    "Free memory", "rain_sensor_heap",
+    "{{ value_json.heap }}", "B",
+    NULL, "measurement", "mdi:memory", true), CFG_HEAP);
+
   publish_config(build_raining_config(), CFG_RAINING);
 }
 
-/*
-  Publish the current state as one JSON message (retained).
-*/
 boolean publish_state()
 {
-  if (!mqtt.connected())
-  {
-    return false;
-  }
-  DynamicJsonDocument doc(256);
-  doc["rain"] = round(total_rain_mm * 100) / 100.0;
-  doc["rate"] = round(last_rate * 10) / 10.0;
+  if (!mqtt.connected()) return false;
+  DynamicJsonDocument doc(384);
+  doc["rain"]    = round(total_rain_mm  * 100) / 100.0;
+  doc["rate"]    = round(last_rate      *  10) /  10.0;
   doc["raining"] = raining_now();
-  doc["rssi"] = WiFi.RSSI();
-  doc["uptime"] = millis() / 1000UL;
-  doc["heap"] = ESP.getFreeHeap();
-
-  char buffer[256];
+  doc["rssi"]    = WiFi.RSSI();
+  doc["uptime"]  = millis() / 1000UL;
+  doc["heap"]    = ESP.getFreeHeap();
+  doc["today"]   = round(rain_today_mm  * 100) / 100.0;
+  doc["week"]    = round(rain_week_mm   * 100) / 100.0;
+  doc["month"]   = round(rain_month_mm  * 100) / 100.0;
+  doc["year"]    = round(rain_year_mm   * 100) / 100.0;
+  char buffer[384];
   serializeJson(doc, buffer, sizeof(buffer));
   return mqtt.publish(TOPIC_STATE, buffer, true);
 }
 
-// ---------------------------------------------------------------------
-//  Web UI
-// ---------------------------------------------------------------------
+// ---- Web UI ----
 
-/*
-  Live status page. Auto-refreshes every 10 s.
-*/
-void handle_root()
+// Stream a single x-axis label for a sparkline.
+void send_xlabel(int idx, int bw, int y, int hi, int xfs, const char *lbl)
 {
-  char html[1700];
-  snprintf(html, sizeof(html),
-           "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-           "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-           "<meta http-equiv='refresh' content='10'>"
-           "<title>Rain sensor</title><style>"
-           "body{font-family:sans-serif;margin:1.5rem;max-width:480px;color:#222}"
-           "h1{font-size:1.3rem}table{width:100%%;border-collapse:collapse}"
-           "td{padding:.45rem;border-bottom:1px solid #e2e2e2}"
-           ".v{text-align:right;font-weight:bold}"
-           "a.btn{display:inline-block;margin-top:1rem;margin-right:.5rem;"
-           "padding:.55rem 1rem;color:#fff;text-decoration:none;border-radius:6px}"
-           "</style></head><body><h1>Rain sensor <small>v%s</small></h1><table>"
-           "<tr><td>Total rain</td><td class='v'>%.2f mm</td></tr>"
-           "<tr><td>Rate</td><td class='v'>%.1f mm/h</td></tr>"
-           "<tr><td>Raining</td><td class='v'>%s</td></tr>"
-           "<tr><td>WiFi signal</td><td class='v'>%d dBm</td></tr>"
-           "<tr><td>IP address</td><td class='v'>%s</td></tr>"
-           "<tr><td>Uptime</td><td class='v'>%lu s</td></tr>"
-           "<tr><td>Free memory</td><td class='v'>%u B</td></tr>"
-           "<tr><td>MQTT</td><td class='v'>%s</td></tr>"
-           "</table>"
-           "<a class='btn' style='background:#185FA5' href='/update'>Firmware update</a>"
-           "<a class='btn' style='background:#A32D2D' href='/resetwifi'>Reset WiFi</a>"
-           "</body></html>",
-           SW_VERSION, total_rain_mm, last_rate, raining_now() ? "yes" : "no",
-           WiFi.RSSI(), WiFi.localIP().toString().c_str(),
-           millis() / 1000UL, ESP.getFreeHeap(),
-           mqtt.connected() ? "connected" : "disconnected");
-  server.send(200, "text/html", html);
+  int cx = 1 + idx * (bw + 1) + bw / 2;
+  char buf[110];
+  snprintf(buf, sizeof(buf),
+    "<text x='%d' y='%d' font-size='%d' fill='%s'"
+    " font-weight='%s' text-anchor='middle'>%s</text>",
+    cx, y, xfs,
+    idx == hi ? "#3b82f6" : "#94a3b8",
+    idx == hi ? "700" : "400",
+    lbl);
+  server.sendContent(buf);
 }
 
-/*
-  Clear stored WiFi credentials and restart into the setup portal.
-*/
+// Sparkline bar chart embedded in a precipitation tile.
+// data  : float array (mm per bucket)
+// n     : number of buckets
+// hi    : currently active bucket index (highlighted), -1 = none
+// type  : 0=hourly(24), 1=weekly(7), 2=monthly(31), 3=yearly(12)
+//
+// Layout (viewBox 0 0 260 124):
+//   TOP=24 px  — value labels above bars
+//   BAREA=80px — bar drawing area  (max bar height 76 px)
+//   BOT=20 px  — x-axis label area
+//
+// Dense charts (n>12): value labels rotated −90° along each bar.
+// Sparse charts (n≤12): value labels horizontal above each bar.
+void send_mini_chart(const float *data, int n, int hi, int type)
+{
+  const int W     = 260;
+  const int TOP   = 24;
+  const int BAREA = 80;
+  const int BOT   = 20;
+  const int H     = TOP + BAREA + BOT;   // 124
+  const int BASE  = TOP + BAREA;          // 104
+  const int MAXBH = BAREA - 4;            // 76
+
+  bool dense = (n > 12);
+  int  bw    = max(2, (W - 2) / n - 1);
+
+  // Font sizes
+  int vfs = dense ? 7 : min(13, max(8, bw * 42 / 100));
+  int xfs = dense ? 6 : min(11, max(7, bw * 37 / 100));
+
+  // Max value
+  float mx = 0;
+  for (int i = 0; i < n; i++) if (data[i] > mx) mx = data[i];
+
+  // SVG open + background + baseline
+  char hdr[240];
+  snprintf(hdr, sizeof(hdr),
+    "<svg viewBox='0 0 %d %d'"
+    " style='width:100%%;margin-top:.6rem;display:block'>"
+    "<rect width='%d' height='%d' fill='#eff6ff' rx='3'/>"
+    "<line x1='1' y1='%d' x2='%d' y2='%d'"
+    " stroke='#bfdbfe' stroke-width='0.8'/>",
+    W, H, W, H, BASE, W - 1, BASE);
+  server.sendContent(hdr);
+
+  // Bars + value labels
+  for (int i = 0; i < n; i++) {
+    if (data[i] == 0) continue;
+    bool hi_bar = (i == hi);
+    int bh = max(2, (int)round(data[i] / mx * MAXBH));
+    int bx = 1 + i * (bw + 1);
+    int by = BASE - bh;
+    int cx = bx + bw / 2;
+
+    // Value string: 1 decimal if < 10, integer otherwise
+    char vs[8];
+    if (data[i] < 10.0f) snprintf(vs, sizeof(vs), "%.1f", data[i]);
+    else                  snprintf(vs, sizeof(vs), "%d", (int)round(data[i]));
+
+    // Bar
+    char bar[100];
+    snprintf(bar, sizeof(bar),
+      "<rect x='%d' y='%d' width='%d' height='%d' fill='%s' rx='1'/>",
+      bx, by, bw, bh,
+      hi_bar ? "#3b82f6" : "#bfdbfe");
+    server.sendContent(bar);
+
+    // Value label
+    if (dense) {
+      // Rotated −90°: text-anchor=start, rotation point at bar top → text reads bottom→top
+      int ty = max(TOP + 14, by - 2);
+      char lbl[200];
+      snprintf(lbl, sizeof(lbl),
+        "<text x='%d' y='%d' font-size='%d' fill='%s'"
+        " font-weight='%s' text-anchor='start'"
+        " transform='rotate(-90 %d %d)'>%s</text>",
+        cx, ty, vfs,
+        hi_bar ? "#1e40af" : "#64748b",
+        hi_bar ? "700" : "400",
+        cx, ty, vs);
+      server.sendContent(lbl);
+    } else {
+      int lbl_y = max(TOP - 2, by - 4);
+      char lbl[150];
+      snprintf(lbl, sizeof(lbl),
+        "<text x='%d' y='%d' font-size='%d' fill='%s'"
+        " font-weight='%s' text-anchor='middle'>%s</text>",
+        cx, lbl_y, vfs,
+        hi_bar ? "#1e40af" : "#64748b",
+        hi_bar ? "700" : "400",
+        vs);
+      server.sendContent(lbl);
+    }
+  }
+
+  // X-axis labels (type-specific)
+  int xlabel_y = H - 3;
+  if (type == 0) {
+    // Hourly: 0h, 6h, 12h, 18h, plus current hour if different
+    const int fp[4] = {0, 6, 12, 18};
+    for (int k = 0; k < 4; k++) {
+      char lbl[4]; snprintf(lbl, sizeof(lbl), "%d", fp[k]);
+      send_xlabel(fp[k], bw, xlabel_y, hi, xfs, lbl);
+    }
+    if (hi >= 0 && hi != 0 && hi != 6 && hi != 12 && hi != 18) {
+      char lbl[12]; snprintf(lbl, sizeof(lbl), "%d", hi);
+      send_xlabel(hi, bw, xlabel_y, hi, xfs, lbl);
+    }
+  } else if (type == 1) {
+    // Weekly: Mo Tu We Th Fr Sa Su
+    const char * const wl[7] = {"Mo","Tu","We","Th","Fr","Sa","Su"};
+    for (int k = 0; k < 7; k++) send_xlabel(k, bw, xlabel_y, hi, xfs, wl[k]);
+  } else if (type == 2) {
+    // Monthly: 1, 5, 10, 15, 20, 25, 31
+    const int       mi[7] = {0, 4, 9, 14, 19, 24, 30};
+    const char * const ml[7] = {"1","5","10","15","20","25","31"};
+    for (int k = 0; k < 7; k++) send_xlabel(mi[k], bw, xlabel_y, hi, xfs, ml[k]);
+  } else {
+    // Yearly: J F M A M J J A S O N D
+    const char * const yl[12] = {"J","F","M","A","M","J","J","A","S","O","N","D"};
+    for (int k = 0; k < 12; k++) send_xlabel(k, bw, xlabel_y, hi, xfs, yl[k]);
+  }
+
+  server.sendContent_P(PSTR("</svg>"));
+}
+
+// Inline SVG bar chart — pastel blue palette, streams from flash.
+void send_bar_chart()
+{
+  const float vals[4] = {rain_today_mm, rain_week_mm, rain_month_mm, rain_year_mm};
+  const char *cols[4] = {"#3b82f6", "#60a5fa", "#93c5fd", "#bfdbfe"};
+  const char *labs[4] = {"Today",   "Week",    "Month",   "Year"};
+  const int   bx[4]   = {20, 105, 190, 275};
+  const int   cx[4]   = {52, 137, 222, 307};
+  const int   BW = 65, BASE = 142, MAXH = 115;
+
+  float mx = 0;
+  for (int i = 0; i < 4; i++) if (vals[i] > mx) mx = vals[i];
+
+  server.sendContent_P(PSTR(
+    "<div class='ca'>"
+    "<div class='lb' style='margin-bottom:.6rem'>Precipitation overview</div>"
+    "<svg viewBox='0 0 340 180' style='width:100%'>"
+    "<rect width='340' height='180' fill='#f0f7ff' rx='10'/>"
+    "<line x1='10' y1='142' x2='330' y2='142' stroke='#bfdbfe' stroke-width='1.5'/>"
+  ));
+
+  char buf[300];
+  for (int i = 0; i < 4; i++) {
+    int bh = (mx > 0 && vals[i] > 0) ? max(2, (int)round(vals[i] / mx * MAXH)) : 0;
+    int by = BASE - bh;
+    int ty = max(14, bh > 14 ? by - 3 : by - 16);
+
+    char vs[10];
+    if      (vals[i] == 0)  strcpy(vs, "0");
+    else if (vals[i] < 10)  snprintf(vs, sizeof(vs), "%.2f", vals[i]);
+    else if (vals[i] < 100) snprintf(vs, sizeof(vs), "%.1f", vals[i]);
+    else                    snprintf(vs, sizeof(vs), "%.0f", vals[i]);
+
+    snprintf(buf, sizeof(buf),
+      "<rect x='%d' y='%d' width='%d' height='%d' fill='%s' rx='4'/>"
+      "<text x='%d' y='%d' text-anchor='middle' font-size='12'"
+      " fill='#1e3a8a' font-weight='600'>%s</text>"
+      "<text x='%d' y='165' text-anchor='middle' font-size='11' fill='#64748b'>%s</text>",
+      bx[i], by, BW, bh, cols[i],
+      cx[i], ty, vs,
+      cx[i], labs[i]);
+    server.sendContent(buf);
+  }
+
+  server.sendContent_P(PSTR("</svg></div>"));
+}
+
+void handle_root()
+{
+  struct tm ti;
+  boolean has_time = get_localtime(ti);
+  char time_str[20] = "not synced";
+  if (has_time) strftime(time_str, sizeof(time_str), "%d.%m.%Y %H:%M", &ti);
+  bool rain = raining_now();
+
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  // ---- HEAD + CSS (pastel blue) + JS tab switcher ----
+  server.sendContent_P(PSTR(
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta http-equiv='refresh' content='10'>"
+    "<title>Rain sensor</title><style>"
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
+    "background:#eff6ff;color:#1e293b}"
+    "nav{background:#dbeafe;padding:.75rem 1.2rem;display:flex;"
+    "align-items:center;justify-content:space-between;"
+    "border-bottom:1px solid #bfdbfe}"
+    ".logo{font-size:1.05rem;font-weight:700;color:#1e40af}"
+    ".logo small{font-weight:400;opacity:.65;margin-left:.35rem;font-size:.75rem}"
+    ".nb{padding:.38rem .75rem;border-radius:6px;font-size:.8rem;"
+    "font-weight:500;text-decoration:none;color:#fff;margin-left:.4rem}"
+    ".nbu{background:#2563eb}.nbr{background:#dc2626}"
+    ".tbr{background:#fff;border-bottom:1px solid #dbeafe;"
+    "display:flex;padding:0 1rem}"
+    ".tn{padding:.65rem 1rem;font-size:.88rem;font-weight:500;"
+    "color:#94a3b8;cursor:pointer;border:none;background:none;"
+    "border-bottom:2px solid transparent;margin-bottom:-1px}"
+    ".ta{color:#2563eb;border-bottom-color:#2563eb;font-weight:600}"
+    ".cn{max-width:820px;margin:0 auto;padding:1.2rem}"
+    ".tp{display:none}.ac{display:block}"
+    ".gr{display:grid;grid-template-columns:1fr 1fr;"
+    "gap:1rem;margin-bottom:1rem}"
+    ".cd{background:#fff;border-radius:14px;padding:1.1rem 1.3rem;"
+    "border:1px solid #e0effe;box-shadow:0 2px 6px rgba(37,99,235,.07)}"
+    ".hl{border-top:3px solid #3b82f6}"
+    ".lb{font-size:.7rem;color:#64748b;text-transform:uppercase;"
+    "letter-spacing:.07em;font-weight:500}"
+    ".vl{font-size:1.9rem;font-weight:700;margin-top:.25rem;"
+    "color:#1e40af;line-height:1.1}"
+    ".un{font-size:.8rem;font-weight:400;color:#93c5fd;margin-left:.1rem}"
+    ".ca{background:#fff;border-radius:14px;padding:1.1rem 1.3rem;"
+    "border:1px solid #e0effe;"
+    "box-shadow:0 2px 6px rgba(37,99,235,.07);margin-bottom:1rem}"
+    ".row{display:flex;align-items:center;gap:.6rem;margin-bottom:.3rem}"
+    ".dot{width:11px;height:11px;border-radius:50%;flex-shrink:0}"
+    ".rn{background:#3b82f6;box-shadow:0 0 8px rgba(59,130,246,.4)}"
+    ".dr{background:#cbd5e1}"
+    ".st{font-size:.95rem;font-weight:600;color:#1e40af}"
+    "table{width:100%;border-collapse:collapse;font-size:.85rem}"
+    "td{padding:.4rem 0;border-bottom:1px solid #f0f7ff;color:#475569}"
+    "td:last-child{text-align:right;font-weight:600;color:#1e3a8a}"
+    "tr:last-child td{border:none}"
+    "</style>"
+    "<script>"
+    "var sw=function(el){"
+    "var id=el.dataset.id;localStorage.setItem('t',id);"
+    "document.querySelectorAll('.tp').forEach("
+    "function(p){p.classList.remove('ac')});"
+    "document.getElementById(id).classList.add('ac');"
+    "document.querySelectorAll('.tn').forEach("
+    "function(n){n.classList.remove('ta')});"
+    "el.classList.add('ta')};"
+    "window.onload=function(){"
+    "var t=localStorage.getItem('t');"
+    "if(t){var b=document.querySelector('.tn[data-id='+t+']');"
+    "if(b)sw(b)}}"
+    "</script></head><body>"
+  ));
+
+  // ---- Navigation bar ----
+  char nav_buf[200];
+  snprintf(nav_buf, sizeof(nav_buf),
+    "<nav><span class='logo'>&#127783; Rain Sensor"
+    "<small>v%s</small></span><span>"
+    "<a class='nb nbu' href='/update'>Update</a>"
+    "<a class='nb nbr' href='/resetwifi'>Reset WiFi</a>"
+    "</span></nav>",
+    SW_VERSION);
+  server.sendContent(nav_buf);
+
+  // ---- Tab bar ----
+  server.sendContent_P(PSTR(
+    "<div class='tbr'>"
+    "<button class='tn ta' data-id='ov' onclick='sw(this)'>Overview</button>"
+    "<button class='tn' data-id='dv' onclick='sw(this)'>Device</button>"
+    "</div>"
+    "<div class='cn'>"
+    "<div id='ov' class='tp ac'>"   // Overview tab — default active
+  ));
+
+  // ---- Overview: raining status + rate ----
+  char status[300];
+  snprintf(status, sizeof(status),
+    "<div class='ca'>"
+    "<div class='row'><div class='dot %s'></div>"
+    "<span class='st'>%s</span></div>"
+    "<div style='font-size:2.3rem;font-weight:700;color:#1e40af;line-height:1'>"
+    "%.1f<span style='font-size:1.1rem;color:#93c5fd;margin-left:.25rem'>"
+    "mm/h</span></div>"
+    "</div>",
+    rain ? "rn" : "dr",
+    rain ? "Raining now" : "Not raining",
+    last_rate);
+  server.sendContent(status);
+
+  // ---- Overview: 2×2 precipitation cards, each with an inline sparkline ----
+  server.sendContent_P(PSTR("<div class='gr'>"));
+
+  char cv[80];
+
+  // Today — hourly bars (24 columns, current hour highlighted)
+  server.sendContent_P(PSTR("<div class='cd hl'><div class='lb'>Today</div>"));
+  snprintf(cv, sizeof(cv), "<div class='vl'>%.2f<span class='un'>mm</span></div>", rain_today_mm);
+  server.sendContent(cv);
+  send_mini_chart(rain_hourly, 24, hist_hour, 0);
+  server.sendContent_P(PSTR("</div>"));
+
+  // This week — 7 bars Mon–Sun (current weekday highlighted)
+  server.sendContent_P(PSTR("<div class='cd'><div class='lb'>This week</div>"));
+  snprintf(cv, sizeof(cv), "<div class='vl'>%.2f<span class='un'>mm</span></div>", rain_week_mm);
+  server.sendContent(cv);
+  send_mini_chart(rain_daily_week, 7, hist_wday, 1);
+  server.sendContent_P(PSTR("</div>"));
+
+  // This month — 31 bars by day (current day highlighted)
+  server.sendContent_P(PSTR("<div class='cd'><div class='lb'>This month</div>"));
+  snprintf(cv, sizeof(cv), "<div class='vl'>%.2f<span class='un'>mm</span></div>", rain_month_mm);
+  server.sendContent(cv);
+  send_mini_chart(rain_daily_month, 31, hist_mday, 2);
+  server.sendContent_P(PSTR("</div>"));
+
+  // This year — 12 bars Jan–Dec (current month highlighted)
+  server.sendContent_P(PSTR("<div class='cd'><div class='lb'>This year</div>"));
+  snprintf(cv, sizeof(cv), "<div class='vl'>%.2f<span class='un'>mm</span></div>", rain_year_mm);
+  server.sendContent(cv);
+  send_mini_chart(rain_monthly, 12, hist_mon, 3);
+  server.sendContent_P(PSTR("</div>"));
+
+  server.sendContent_P(PSTR("</div>"));  // end .gr
+
+  // ---- Overview: bar chart ----
+  send_bar_chart();
+
+  // ---- Device tab ----
+  server.sendContent_P(PSTR(
+    "</div>"                          // end #ov
+    "<div id='dv' class='tp'>"
+    "<div class='ca'>"
+  ));
+
+  char dev[400];
+  snprintf(dev, sizeof(dev),
+    "<table>"
+    "<tr><td>IP address</td><td>%s</td></tr>"
+    "<tr><td>WiFi signal</td><td>%d dBm</td></tr>"
+    "<tr><td>MQTT</td><td>%s</td></tr>"
+    "<tr><td>Uptime</td><td>%lu s</td></tr>"
+    "<tr><td>Free memory</td><td>%u B</td></tr>"
+    "<tr><td>Total since boot</td><td>%.2f mm</td></tr>"
+    "<tr><td>Time (NTP)</td><td>%s</td></tr>"
+    "</table>",
+    WiFi.localIP().toString().c_str(),
+    WiFi.RSSI(),
+    mqtt.connected() ? "connected" : "disconnected",
+    millis() / 1000UL,
+    ESP.getFreeHeap(),
+    total_rain_mm,
+    time_str);
+  server.sendContent(dev);
+
+  server.sendContent_P(PSTR("</div></div></div></body></html>"));
+}
+
 void handle_reset_wifi()
 {
+  save_stats();
+  save_history();
   server.send(200, "text/html",
-              "<html><body style='font-family:sans-serif;margin:2rem'>"
-              "WiFi settings cleared. The device is restarting and will "
-              "open the <b>" AP_NAME "</b> setup portal.</body></html>");
+    "<html><body style='font-family:sans-serif;margin:2rem'>"
+    "WiFi settings cleared. The device is restarting and will "
+    "open the <b>" AP_NAME "</b> setup portal.</body></html>");
   delay(1000);
   wm.resetSettings();
   ESP.restart();
 }
 
-// ---------------------------------------------------------------------
-//  Setup / loop
-// ---------------------------------------------------------------------
+// ---- Setup / loop ----
 
 void setup()
 {
   Serial.begin(115200);
-
   pinMode(RAIN_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RAIN_PIN), count_tipping, FALLING);
 
-  if (!LittleFS.begin())
-  {
+  if (!LittleFS.begin()) {
     Serial.println("LittleFS mount failed, formatting...");
     LittleFS.format();
     LittleFS.begin();
   }
   load_config();
 
-  // WiFiManager: captive portal for WiFi + MQTT settings. The portal
-  // scans for available networks and lets the user pick one and enter
-  // the password, plus the MQTT broker details below.
-  WiFiManagerParameter p_host("host", "MQTT host", config.host, sizeof(config.host) - 1);
-  WiFiManagerParameter p_port("port", "MQTT port", config.port, sizeof(config.port) - 1);
-  WiFiManagerParameter p_user("user", "MQTT user", config.user, sizeof(config.user) - 1);
+  WiFiManagerParameter p_host("host", "MQTT host",     config.host, sizeof(config.host) - 1);
+  WiFiManagerParameter p_port("port", "MQTT port",     config.port, sizeof(config.port) - 1);
+  WiFiManagerParameter p_user("user", "MQTT user",     config.user, sizeof(config.user) - 1);
   WiFiManagerParameter p_pass("pass", "MQTT password", config.pass, sizeof(config.pass) - 1);
   wm.addParameter(&p_host);
   wm.addParameter(&p_port);
   wm.addParameter(&p_user);
   wm.addParameter(&p_pass);
   wm.setSaveConfigCallback(save_config_callback);
-  wm.setConfigPortalTimeout(180); // give up the portal after 3 min
+  wm.setConfigPortalTimeout(180);
 
-  if (!wm.autoConnect(AP_NAME))
-  {
+  if (!wm.autoConnect(AP_NAME)) {
     Serial.println("WiFi connect/portal failed, restarting");
     delay(2000);
     ESP.restart();
   }
 
-  if (shouldSaveConfig)
-  {
+  if (shouldSaveConfig) {
     strlcpy(config.host, p_host.getValue(), sizeof(config.host));
     strlcpy(config.port, p_port.getValue(), sizeof(config.port));
     strlcpy(config.user, p_user.getValue(), sizeof(config.user));
@@ -488,62 +930,74 @@ void setup()
   Serial.print("WiFi connected, IP: ");
   Serial.println(WiFi.localIP());
 
-  // MQTT
+  sync_ntp();
+  load_stats();
+  load_history();
+  check_rollover(); // reset any periods that elapsed while the device was off
+
   mqtt.setServer(config.host, atoi(config.port));
   mqtt.setBufferSize(MQTT_MAX_TRANSFER_SIZE);
-  if (mqtt_reconnect())
-  {
-    publish_discovery();
-  }
+  if (mqtt_reconnect()) publish_discovery();
 
-  // Web server + OTA
   server.on("/", handle_root);
   server.on("/resetwifi", handle_reset_wifi);
-  ElegantOTA.begin(&server); // serves the /update page
+  ElegantOTA.begin(&server);
   server.begin();
   Serial.println("Web server started on port 80");
 
-  // force a send on the first loop iteration
-  last_send_rain = millis() - RAIN_ACTIVE_INTERVAL_S * 1000UL;
+  last_send_rain    = millis() - RAIN_ACTIVE_INTERVAL_S * 1000UL;
+  last_stats_save   = millis();
+  last_rollover_chk = millis();
 }
 
 void loop()
 {
   server.handleClient();
-  ElegantOTA.loop();
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
+  if (WiFi.status() == WL_CONNECTED) {
     mqtt_reconnect();
     mqtt.loop();
   }
 
-  // Accumulate tips immediately so they are never lost on a failed publish.
+  // Accumulate tips into period totals and history buckets.
   unsigned int tips = peek_tips();
-  if (tips > 0)
-  {
+  if (tips > 0) {
     consume_tips(tips);
     float mm = tips * MM_PER_TIP;
-    total_rain_mm += mm;
+    total_rain_mm  += mm;
     period_rain_mm += mm;
+    rain_today_mm  += mm;
+    rain_week_mm   += mm;
+    rain_month_mm  += mm;
+    rain_year_mm   += mm;
+    if (hist_hour >= 0) rain_hourly[hist_hour]      += mm;
+    if (hist_wday >= 0) rain_daily_week[hist_wday]  += mm;
+    if (hist_mday >= 0) rain_daily_month[hist_mday] += mm;
+    if (hist_mon  >= 0) rain_monthly[hist_mon]       += mm;
   }
 
-  // Adaptive interval based on recent rain activity.
+  // Check for day/week/month/year rollover once per minute.
+  if (millis() - last_rollover_chk > 60000UL) {
+    last_rollover_chk = millis();
+    check_rollover();
+  }
+
+  // Persist stats and history periodically to survive power loss.
+  if (millis() - last_stats_save > STATS_SAVE_MS) {
+    last_stats_save = millis();
+    save_stats();
+    save_history();
+  }
+
   unsigned long interval_ms = (millis() - last_tip_time < NO_RAIN_TIMEOUT_MS)
                                   ? RAIN_ACTIVE_INTERVAL_S * 1000UL
-                                  : RAIN_IDLE_INTERVAL_S * 1000UL;
+                                  : RAIN_IDLE_INTERVAL_S   * 1000UL;
 
-  if (millis() - last_send_rain > interval_ms)
-  {
-    // rate in mm/h based on the rain accumulated over this period
+  if (millis() - last_send_rain > interval_ms) {
     unsigned long elapsed_ms = millis() - last_send_rain;
     if (elapsed_ms > 0)
-    {
       last_rate = (period_rain_mm / (elapsed_ms / 1000.0)) * 3600.0;
-    }
-
-    if (publish_state())
-    {
+    if (publish_state()) {
       period_rain_mm = 0.0;
       last_send_rain = millis();
     }
