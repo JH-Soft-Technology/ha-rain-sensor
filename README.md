@@ -28,6 +28,7 @@ snapshot of the real dashboard:
 |---|---|
 | `src/` | Firmware source (`main.cpp`) |
 | `demo/` | Static preview of the web dashboard + screenshot |
+| `home-assistant/` | Ready-to-use Home Assistant dashboard template |
 | `3d_print/` | STL files for the sensor mount |
 | `content/` | Wiring schematic and other images |
 | `platformio.ini` | PlatformIO build configuration |
@@ -108,6 +109,23 @@ tracks resets (after a reboot) and can build its own long-term statistics.
 
 The send interval adapts automatically: **every 60 s** while it is raining,
 **every 30 min** after 20 minutes without rain.
+
+## Recreate the device dashboard in Home Assistant
+
+The per-hour / per-day / per-month bar charts you see on the device are rendered
+locally and are **not** sent over MQTT — there is no need to. Home Assistant can
+rebuild them from the cumulative `Rain` sensor (`total_increasing`), which feeds
+HA's long-term statistics.
+
+A ready-to-use template is provided in
+[`home-assistant/rain-sensor-homeassistant.yaml`](home-assistant/rain-sensor-homeassistant.yaml). It contains:
+
+- `utility_meter` helpers for today / week / month / year (HA-side resets)
+- a Lovelace dashboard mirroring the device's **Overview** and **Device** tabs, with bar charts built from the built-in `statistics-graph` card (no HACS required)
+- an optional ApexCharts variant for nicer bars
+
+Check the entity IDs at the top of the file against your install
+(Settings → Devices & Services → Entities) before pasting it in.
 
 ## Build and development
 
