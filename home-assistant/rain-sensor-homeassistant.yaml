@@ -1,0 +1,216 @@
+# =============================================================================
+#  Rain sensor  ->  Home Assistant template
+#  Replikuje palubní dashboard zařízení (Overview + Device) přímo v HA.
+# =============================================================================
+#
+#  PŘEDPOKLAD: senzor je už přidaný přes MQTT discovery.
+#
+#  !!! NEŽ TO POUŽIJEŠ: ověř entity_id !!!
+#  Settings -> Devices & Services -> Entities (filtruj "Rain sensor"),
+#  nebo Developer Tools -> States. Níže používám tyto odhadnuté id
+#  (HA je skládá jako <nazev zarizeni>_<nazev entity>):
+#
+#    sensor.rain_sensor_rain            (kumulativní úhrn, total_increasing)  <- KLÍČOVÝ
+#    sensor.rain_sensor_rain_rate       (mm/h)
+#    sensor.rain_sensor_rain_today
+#    sensor.rain_sensor_rain_this_week
+#    sensor.rain_sensor_rain_this_month
+#    sensor.rain_sensor_rain_this_year
+#    sensor.rain_sensor_wifi_signal     (dBm, diagnostic)
+#    sensor.rain_sensor_uptime          (s, diagnostic)
+#    sensor.rain_sensor_free_memory     (B, diagnostic)
+#    binary_sensor.rain_sensor_raining
+#
+#  Pokud se tvoje liší, jen je v této šabloně nahraď (Najít/Nahradit).
+# =============================================================================
+
+
+# =============================================================================
+#  ČÁST 1 — configuration.yaml
+# -----------------------------------------------------------------------------
+#  utility_meter helpery: počítají dnes/týden/měsíc/rok z KUMULATIVNÍHO
+#  senzoru, s resetem řízeným časovou zónou HA (Europe/Prague). Jsou to
+#  alternativa k firmwarovým sensor.rain_sensor_rain_today/week/month/year —
+#  použij, co ti vyhovuje. Výhoda HA verze: reset přesně podle HA, historie
+#  v dlouhodobých statistikách.
+#
+#  Vlož do configuration.yaml (nebo do packages) a restartuj HA.
+# =============================================================================
+
+utility_meter:
+  rain_today_ha:
+    source: sensor.rain_sensor_rain
+    name: Rain today (HA)
+    cycle: daily
+  rain_week_ha:
+    source: sensor.rain_sensor_rain
+    name: Rain this week (HA)
+    cycle: weekly
+  rain_month_ha:
+    source: sensor.rain_sensor_rain
+    name: Rain this month (HA)
+    cycle: monthly
+  rain_year_ha:
+    source: sensor.rain_sensor_rain
+    name: Rain this year (HA)
+    cycle: yearly
+
+
+# =============================================================================
+#  ČÁST 2 — Lovelace dashboard
+# -----------------------------------------------------------------------------
+#  Zkopíruj NÍŽE uvedené (od "title:" dál) do nového dashboardu:
+#  Settings -> Dashboards -> + Add dashboard -> (otevři) -> tři tečky ->
+#  Edit dashboard -> tři tečky -> Raw configuration editor -> vlož.
+#
+#  Grafy po hodinách/dnech/měsících kreslí vestavěná karta
+#  "statistics-graph" z kumulativního senzoru (stat_types: sum + chart_type:
+#  bar = úhrn za každý sloupec, stejně jako Energy dashboard). Žádné HACS.
+#  Hezčí variantu přes ApexCharts najdeš na konci souboru.
+# =============================================================================
+
+title: Rain
+views:
+  # ----------------------------------------------------------------- Overview
+  - title: Overview
+    path: rain-overview
+    icon: mdi:weather-pouring
+    cards:
+      - type: heading
+        heading: Rain sensor
+        heading_style: title
+
+      # --- Prší teď + intenzita ---
+      - type: glance
+        title: Raining now
+        show_state: true
+        entities:
+          - entity: binary_sensor.rain_sensor_raining
+            name: Raining
+          - entity: sensor.rain_sensor_rain_rate
+            name: Rate
+
+      # --- Velká čísla period ---
+      - type: glance
+        columns: 4
+        state_color: false
+        entities:
+          - entity: sensor.rain_sensor_rain_today
+            name: Today
+          - entity: sensor.rain_sensor_rain_this_week
+            name: This week
+          - entity: sensor.rain_sensor_rain_this_month
+            name: This month
+          - entity: sensor.rain_sensor_rain_this_year
+            name: This year
+
+      # --- Dnes po hodinách ---
+      - type: statistics-graph
+        title: Today (per hour)
+        chart_type: bar
+        period: hour
+        days_to_show: 1
+        stat_types:
+          - sum
+        entities:
+          - sensor.rain_sensor_rain
+
+      # --- Tento týden po dnech ---
+      - type: statistics-graph
+        title: This week (per day)
+        chart_type: bar
+        period: day
+        days_to_show: 7
+        stat_types:
+          - sum
+        entities:
+          - sensor.rain_sensor_rain
+
+      # --- Tento měsíc po dnech ---
+      - type: statistics-graph
+        title: This month (per day)
+        chart_type: bar
+        period: day
+        days_to_show: 31
+        stat_types:
+          - sum
+        entities:
+          - sensor.rain_sensor_rain
+
+      # --- Tento rok po měsících ---
+      - type: statistics-graph
+        title: This year (per month)
+        chart_type: bar
+        period: month
+        days_to_show: 365
+        stat_types:
+          - sum
+        entities:
+          - sensor.rain_sensor_rain
+
+  # ------------------------------------------------------------------- Device
+  - title: Device
+    path: rain-device
+    icon: mdi:chip
+    cards:
+      - type: heading
+        heading: Device
+        heading_style: title
+
+      - type: entities
+        entities:
+          - entity: sensor.rain_sensor_rain
+            name: Total since boot
+          - entity: binary_sensor.rain_sensor_raining
+            name: Raining
+          - entity: sensor.rain_sensor_rain_rate
+            name: Rate
+          - type: section
+            label: Diagnostics
+          - entity: sensor.rain_sensor_wifi_signal
+            name: WiFi signal
+          - entity: sensor.rain_sensor_uptime
+            name: Uptime
+          - entity: sensor.rain_sensor_free_memory
+            name: Free memory
+
+      # IP adresa zařízení se přes MQTT NEPOSÍLÁ (je jen na webu zařízení),
+      # takže ji v HA nenajdeš. Otevři přímo http://<ip-zarizeni>/ .
+
+      # --- HA utility_meter verze period (pokud je používáš místo firmwaru) ---
+      - type: entities
+        title: Period totals (HA utility_meter)
+        entities:
+          - sensor.rain_today_ha
+          - sensor.rain_week_ha
+          - sensor.rain_month_ha
+          - sensor.rain_year_ha
+
+
+# =============================================================================
+#  ČÁST 3 (VOLITELNÉ) — hezčí grafy přes ApexCharts (vyžaduje HACS)
+# -----------------------------------------------------------------------------
+#  Nainstaluj "apexcharts-card" přes HACS. ApexCharts umí přímo "diff" přírůstek
+#  z kumulativního senzoru => čisté sloupce úhrnu za hodinu/den/měsíc.
+#  Příklad nahrazuje kartu "Today (per hour)":
+#
+#  - type: custom:apexcharts-card
+#    header:
+#      show: true
+#      title: Today (per hour)
+#    graph_span: 24h
+#    span:
+#      start: day
+#    series:
+#      - entity: sensor.rain_sensor_rain
+#        name: Rain
+#        type: column
+#        unit: mm
+#        group_by:
+#          func: diff      # přírůstek = úhrn za interval
+#          duration: 1h
+#
+#  Pro týden:   graph_span: 7d,  group_by duration: 1d,  span start: week
+#  Pro měsíc:   graph_span: 31d, group_by duration: 1d,  span start: month
+#  Pro rok:     graph_span: 365d,group_by duration: 1month (resp. 30d)
+# =============================================================================
