@@ -23,11 +23,10 @@
 #
 #  Pokud se tvoje liší, jen je v této šabloně nahraď (Najít/Nahradit).
 #
-#  POZN. ke kumulativnímu senzoru: pokud z dřívějších verzí firmwaru zůstala
-#  v registru "duch" entita, HA mohl novou pojmenovat
-#  sensor.rain_sensor_rain_sensor (dvojitá přípona). Buď ji použij tak, jak
-#  je, nebo starou nedostupnou entitu smaž a tuhle přejmenuj zpět na
-#  sensor.rain_sensor_rain.
+#  POZN. ke kumulativnímu senzoru: HA může tuto entitu pojmenovat
+#  sensor.rain_sensor_rain_sensor (dvojitá přípona, odvozeno z názvu
+#  zařízení + entity). Buď ji použij tak, jak je, nebo v Settings ->
+#  Entities změň její Entity ID na sensor.rain_sensor_rain.
 # =============================================================================
 
 
