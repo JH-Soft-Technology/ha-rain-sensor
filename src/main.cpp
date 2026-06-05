@@ -15,7 +15,7 @@
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.6.0
+  version: 0.6.1
   last change: 04.06.2026
 */
 #include <Arduino.h>
@@ -29,7 +29,7 @@
 #include <time.h>
 
 #define MODEL      "rainy 0.0.2"
-#define SW_VERSION "0.6.0"
+#define SW_VERSION "0.6.1"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME     "ha-rain-sensor"
@@ -190,9 +190,10 @@ void load_stats()
   if (!LittleFS.exists("/stats.json")) return;
   File f = LittleFS.open("/stats.json", "r");
   if (!f) return;
-  DynamicJsonDocument doc(256);
+  DynamicJsonDocument doc(320);
   if (deserializeJson(doc, f)) { f.close(); return; }
   f.close();
+  total_rain_mm = doc["total"] | 0.0f;
   rain_today_mm = doc["today"] | 0.0f;
   rain_week_mm  = doc["week"]  | 0.0f;
   rain_month_mm = doc["month"] | 0.0f;
@@ -205,7 +206,8 @@ void load_stats()
 
 void save_stats()
 {
-  DynamicJsonDocument doc(256);
+  DynamicJsonDocument doc(320);
+  doc["total"] = total_rain_mm;
   doc["today"] = rain_today_mm;
   doc["week"]  = rain_week_mm;
   doc["month"] = rain_month_mm;
@@ -858,7 +860,7 @@ void handle_root()
     "<tr><td>MQTT</td><td>%s</td></tr>"
     "<tr><td>Uptime</td><td>%lu s</td></tr>"
     "<tr><td>Free memory</td><td>%u B</td></tr>"
-    "<tr><td>Total since boot</td><td>%.2f mm</td></tr>"
+    "<tr><td>Total</td><td>%.2f mm</td></tr>"
     "<tr><td>Time (NTP)</td><td>%s</td></tr>"
     "</table>",
     WiFi.localIP().toString().c_str(),
