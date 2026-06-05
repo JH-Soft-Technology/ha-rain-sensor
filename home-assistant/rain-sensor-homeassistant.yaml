@@ -22,17 +22,25 @@
 #    binary_sensor.rain_sensor_raining
 #
 #  Pokud se tvoje liší, jen je v této šabloně nahraď (Najít/Nahradit).
+#
+#  POZN. ke kumulativnímu senzoru: HA může tuto entitu pojmenovat
+#  sensor.rain_sensor_rain_sensor (dvojitá přípona, odvozeno z názvu
+#  zařízení + entity). Buď ji použij tak, jak je, nebo v Settings ->
+#  Entities změň její Entity ID na sensor.rain_sensor_rain.
 # =============================================================================
 
 
 # =============================================================================
-#  ČÁST 1 — configuration.yaml
+#  ČÁST 1 — configuration.yaml  (VOLITELNÉ)
 # -----------------------------------------------------------------------------
-#  utility_meter helpery: počítají dnes/týden/měsíc/rok z KUMULATIVNÍHO
-#  senzoru, s resetem řízeným časovou zónou HA (Europe/Prague). Jsou to
-#  alternativa k firmwarovým sensor.rain_sensor_rain_today/week/month/year —
-#  použij, co ti vyhovuje. Výhoda HA verze: reset přesně podle HA, historie
-#  v dlouhodobých statistikách.
+#  POZN.: firmware už dnes/týden/měsíc/rok posílá jako samostatné entity
+#  (sensor.rain_sensor_rain_today / _this_week / _this_month / _this_year),
+#  takže pro velká čísla na dashboardu utility_meter NEPOTŘEBUJEŠ. Tahle
+#  část je jen pokud chceš periody řízené čistě časovou zónou HA.
+#
+#  DŮLEŽITÉ: zdrojem je KUMULATIVNÍ senzor (total_increasing). Ten se
+#  resetuje jen při rebootu, ne na začátku každého cyklu, proto musí být
+#  periodically_resetting: false — jinak metr zůstává na 0 / přeskakuje.
 #
 #  Vlož do configuration.yaml (nebo do packages) a restartuj HA.
 # =============================================================================
@@ -42,18 +50,22 @@ utility_meter:
     source: sensor.rain_sensor_rain
     name: Rain today (HA)
     cycle: daily
+    periodically_resetting: false
   rain_week_ha:
     source: sensor.rain_sensor_rain
     name: Rain this week (HA)
     cycle: weekly
+    periodically_resetting: false
   rain_month_ha:
     source: sensor.rain_sensor_rain
     name: Rain this month (HA)
     cycle: monthly
+    periodically_resetting: false
   rain_year_ha:
     source: sensor.rain_sensor_rain
     name: Rain this year (HA)
     cycle: yearly
+    periodically_resetting: false
 
 
 # =============================================================================
