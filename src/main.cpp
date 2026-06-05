@@ -15,7 +15,7 @@
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.6.1
+  version: 0.6.2
   last change: 05.06.2026
 */
 #include <Arduino.h>
@@ -29,7 +29,7 @@
 #include <time.h>
 
 #define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.6.1"
+#define SW_VERSION "0.6.2"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME "ha-rain-sensor"
@@ -38,8 +38,16 @@
 
 #define RAIN_ACTIVE_INTERVAL_S 60
 #define RAIN_IDLE_INTERVAL_S 1800
-#define NO_RAIN_TIMEOUT_MS 1200000UL
-#define RAIN_NOW_WINDOW_MS 360000UL
+
+// Adaptive "raining" detection. A tipping bucket is quantized (one tip =
+// 0.2794 mm), so in light rain the gap between tips can be tens of minutes
+// and a fixed window flickers to "not raining" between tips. Instead we
+// wait ~FACTOR x the last gap between tips, clamped to [MIN, MAX]:
+// heavy rain -> short timeout (turns off quickly after it stops),
+// drizzle    -> long timeout  (does not flicker during long gaps).
+#define RAIN_TIMEOUT_FACTOR 2
+#define RAIN_MIN_TIMEOUT_MS 600000UL   // 10 min
+#define RAIN_MAX_TIMEOUT_MS 3600000UL  // 60 min
 
 #define MQTT_RECONNECT_INTERVAL_MS 5000
 #define DEBOUNCE_MS 150
@@ -88,6 +96,7 @@ WiFiManager wm;
 
 volatile unsigned int tipping_count = 0;
 volatile unsigned long last_tip_time = 0;
+volatile unsigned long last_tip_interval = 0; // gap (ms) between the last two tips
 
 float total_rain_mm = 0.0;
 float period_rain_mm = 0.0;
@@ -128,6 +137,7 @@ IRAM_ATTR void count_tipping()
   unsigned long now = millis();
   if (now - last_tip_time > DEBOUNCE_MS)
   {
+    if (last_tip_time != 0) last_tip_interval = now - last_tip_time;
     tipping_count++;
     last_tip_time = now;
   }
@@ -148,9 +158,21 @@ void consume_tips(unsigned int n)
   interrupts();
 }
 
+// How long without a tip until we decide it stopped raining. Scales with
+// the last gap between tips so light rain doesn't flicker, clamped so heavy
+// rain turns off promptly and a lone tip doesn't latch "raining" forever.
+unsigned long rain_timeout_ms()
+{
+  unsigned long t = (unsigned long)RAIN_TIMEOUT_FACTOR * last_tip_interval;
+  if (t < RAIN_MIN_TIMEOUT_MS) t = RAIN_MIN_TIMEOUT_MS;
+  if (t > RAIN_MAX_TIMEOUT_MS) t = RAIN_MAX_TIMEOUT_MS;
+  return t;
+}
+
 boolean raining_now()
 {
-  return (millis() - last_tip_time) < RAIN_NOW_WINDOW_MS;
+  if (last_tip_time == 0) return false; // no tip ever -> not raining
+  return (millis() - last_tip_time) < rain_timeout_ms();
 }
 
 // ---- Time helpers ----
@@ -1102,7 +1124,7 @@ void loop()
     save_history();
   }
 
-  unsigned long interval_ms = (millis() - last_tip_time < NO_RAIN_TIMEOUT_MS)
+  unsigned long interval_ms = raining_now()
                                   ? RAIN_ACTIVE_INTERVAL_S * 1000UL
                                   : RAIN_IDLE_INTERVAL_S * 1000UL;
 
