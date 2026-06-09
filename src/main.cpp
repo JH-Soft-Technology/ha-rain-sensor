@@ -15,7 +15,7 @@
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.6.2
+  version: 0.6.3
   last change: 05.06.2026
 */
 #include <Arduino.h>
@@ -29,7 +29,7 @@
 #include <time.h>
 
 #define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.6.2"
+#define SW_VERSION "0.6.3"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME "ha-rain-sensor"
@@ -828,6 +828,7 @@ void handle_root()
     strftime(time_str, sizeof(time_str), "%d.%m.%Y %H:%M", &ti);
   bool rain = raining_now();
 
+  server.sendHeader("Connection", "close");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/html", "");
 
@@ -836,7 +837,6 @@ void handle_root()
       "<!DOCTYPE html><html><head>"
       "<meta charset='utf-8'>"
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-      "<meta http-equiv='refresh' content='10'>"
       "<title>Rain sensor</title><style>"
       "*{box-sizing:border-box;margin:0;padding:0}"
       "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;"
