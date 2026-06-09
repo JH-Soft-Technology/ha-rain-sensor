@@ -15,7 +15,7 @@
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.6.3
+  version: 0.7.0
   last change: 05.06.2026
 */
 #include <Arduino.h>
@@ -29,7 +29,7 @@
 #include <time.h>
 
 #define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.6.3"
+#define SW_VERSION "0.7.0"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME "ha-rain-sensor"
@@ -848,7 +848,17 @@ void handle_root()
       ".logo small{font-weight:400;opacity:.65;margin-left:.35rem;font-size:.75rem}"
       ".nb{padding:.38rem .75rem;border-radius:6px;font-size:.8rem;"
       "font-weight:500;text-decoration:none;color:#fff;margin-left:.4rem}"
-      ".nbu{background:#2563eb}.nbr{background:#dc2626}"
+      ".nbu{background:#2563eb}.nbr{background:#dc2626}.nbo{background:#d97706}"
+      ".ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);"
+      "z-index:10;align-items:center;justify-content:center}.ov.sh{display:flex}"
+      ".mdl{background:#fff;border-radius:10px;padding:1.4rem;max-width:340px;"
+      "margin:1rem;box-shadow:0 10px 30px rgba(0,0,0,.2)}"
+      ".mdl h3{font-size:1rem;color:#1e293b;margin-bottom:.6rem}"
+      ".mdl p{font-size:.85rem;color:#475569;line-height:1.45;margin-bottom:1.1rem}"
+      ".mrow{display:flex;gap:.5rem;justify-content:flex-end}"
+      ".mbtn{padding:.45rem .9rem;border-radius:6px;font-size:.82rem;"
+      "font-weight:500;border:none;cursor:pointer;font-family:inherit}"
+      ".mc{background:#e2e8f0;color:#1e293b}.mok{background:#dc2626;color:#fff}"
       ".tbr{background:#fff;border-bottom:1px solid #dbeafe;"
       "display:flex;padding:0 1rem}"
       ".tn{padding:.65rem 1rem;font-size:.88rem;font-weight:500;"
@@ -892,19 +902,34 @@ void handle_root()
       "window.onload=function(){"
       "var t=localStorage.getItem('t');"
       "if(t){var b=document.querySelector('.tn[data-id='+t+']');"
-      "if(b)sw(b)}}"
+      "if(b)sw(b)}};"
+      "var rr=function(){document.getElementById('rovl').classList.add('sh')};"
+      "var rc=function(){document.getElementById('rovl').classList.remove('sh')};"
       "</script></head><body>"));
 
   // ---- Navigation bar ----
-  char nav_buf[200];
+  char nav_buf[360];
   snprintf(nav_buf, sizeof(nav_buf),
            "<nav><span class='logo'>&#127783; Rain Sensor"
            "<small>v%s</small></span><span>"
            "<a class='nb nbu' href='/update'>Update</a>"
+           "<a class='nb nbo' href='#' onclick='rr();return false'>Reset úhrnu srážek</a>"
            "<a class='nb nbr' href='/resetwifi'>Reset WiFi</a>"
            "</span></nav>",
            SW_VERSION);
   server.sendContent(nav_buf);
+
+  // ---- Rain reset confirmation dialog ----
+  server.sendContent_P(PSTR(
+      "<div class='ov' id='rovl'><div class='mdl'>"
+      "<h3>Reset úhrnu srážek</h3>"
+      "<p>Opravdu vynulovat všechny naměřené srážky? Vynuluje se celkový "
+      "úhrn i hodnoty za dnešek, týden, měsíc a rok včetně grafů. "
+      "Akci nelze vrátit zpět.</p>"
+      "<div class='mrow'>"
+      "<button class='mbtn mc' onclick='rc()'>Storno</button>"
+      "<button class='mbtn mok' onclick=\"location.href='/resetrain'\">Potvrdit</button>"
+      "</div></div></div>"));
 
   // ---- Tab bar ----
   server.sendContent_P(PSTR(
@@ -996,6 +1021,34 @@ void handle_root()
   server.sendContent_P(PSTR("</div></div></div></body></html>"));
 }
 
+void handle_reset_rain()
+{
+  // Zero every accumulated rainfall value (used to clear bogus test data).
+  noInterrupts();
+  tipping_count = 0; // drop any pending unconsumed tips
+  interrupts();
+
+  total_rain_mm = 0.0;
+  period_rain_mm = 0.0;
+  last_rate = 0.0;
+  rain_today_mm = 0.0;
+  rain_week_mm = 0.0;
+  rain_month_mm = 0.0;
+  rain_year_mm = 0.0;
+  for (int i = 0; i < 24; i++) rain_hourly[i] = 0.0;
+  for (int i = 0; i < 7; i++) rain_daily_week[i] = 0.0;
+  for (int i = 0; i < 31; i++) rain_daily_month[i] = 0.0;
+  for (int i = 0; i < 12; i++) rain_monthly[i] = 0.0;
+
+  save_stats();      // persist the zeroed totals so the reset survives reboot
+  save_history();
+  publish_state();   // push zeros to Home Assistant right away
+
+  server.sendHeader("Connection", "close");
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "Rain totals reset");
+}
+
 void handle_reset_wifi()
 {
   save_stats();
@@ -1068,6 +1121,7 @@ void setup()
 
   server.on("/", handle_root);
   server.on("/resetwifi", handle_reset_wifi);
+  server.on("/resetrain", handle_reset_rain);
   ElegantOTA.begin(&server);
   server.begin();
   Serial.println("Web server started on port 80");
