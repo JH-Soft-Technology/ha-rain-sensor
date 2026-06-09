@@ -76,8 +76,8 @@ utility_meter:
 #  Edit dashboard -> tři tečky -> Raw configuration editor -> vlož.
 #
 #  Grafy po hodinách/dnech/měsících kreslí vestavěná karta
-#  "statistics-graph" z kumulativního senzoru (stat_types: sum + chart_type:
-#  bar = úhrn za každý sloupec, stejně jako Energy dashboard). Žádné HACS.
+#  "statistics-graph" z kumulativního senzoru (stat_types: change + chart_type:
+#  bar = přírůstek za každý sloupec = úhrn za to období). Žádné HACS.
 #  Hezčí variantu přes ApexCharts najdeš na konci souboru.
 # =============================================================================
 
@@ -123,7 +123,7 @@ views:
         period: hour
         days_to_show: 1
         stat_types:
-          - sum
+          - change
         entities:
           - sensor.rain_sensor_rain
 
@@ -134,7 +134,7 @@ views:
         period: day
         days_to_show: 7
         stat_types:
-          - sum
+          - change
         entities:
           - sensor.rain_sensor_rain
 
@@ -145,7 +145,7 @@ views:
         period: day
         days_to_show: 31
         stat_types:
-          - sum
+          - change
         entities:
           - sensor.rain_sensor_rain
 
@@ -156,7 +156,7 @@ views:
         period: month
         days_to_show: 365
         stat_types:
-          - sum
+          - change
         entities:
           - sensor.rain_sensor_rain
 
