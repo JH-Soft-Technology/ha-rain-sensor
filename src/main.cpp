@@ -15,7 +15,7 @@
   author: Jiri Horalek
   email: horalek.jiri@gmail.com
   site: https://github.com/JH-Soft-Technology/ha-rain-sensor
-  version: 0.7.0
+  version: 0.7.1
   last change: 05.06.2026
 */
 #include <Arduino.h>
@@ -29,7 +29,7 @@
 #include <time.h>
 
 #define MODEL "rainy 0.0.2"
-#define SW_VERSION "0.7.0"
+#define SW_VERSION "0.7.1"
 
 #define MQTT_MAX_TRANSFER_SIZE 1024
 #define MQTT_INSTANCE_NAME "ha-rain-sensor"
@@ -99,8 +99,6 @@ volatile unsigned long last_tip_time = 0;
 volatile unsigned long last_tip_interval = 0; // gap (ms) between the last two tips
 
 float total_rain_mm = 0.0;
-float period_rain_mm = 0.0;
-float last_rate = 0.0;
 
 // Period statistics — reset daily/weekly/monthly/yearly via NTP time
 float rain_today_mm = 0.0;
@@ -173,6 +171,21 @@ boolean raining_now()
 {
   if (last_tip_time == 0) return false; // no tip ever -> not raining
   return (millis() - last_tip_time) < rain_timeout_ms();
+}
+
+// Rain rate (mm/h) derived from the interval between tips, not from counting
+// tips in a fixed window. A tipping bucket is quantized (one tip = 0.2794 mm),
+// so counting per minute reads 0 between tips and spikes on the tip. Using the
+// gap between tips gives a smooth value: rate = mm_per_tip / gap. As time since
+// the last tip grows past that gap, the rate decays; once raining_now() expires
+// it returns 0.
+float rain_rate_mm_h()
+{
+  if (last_tip_interval == 0) return 0.0; // need >= 2 tips to know a rate
+  if (!raining_now()) return 0.0;         // rain stopped (adaptive timeout)
+  unsigned long since = millis() - last_tip_time;
+  unsigned long gap = (since > last_tip_interval) ? since : last_tip_interval;
+  return MM_PER_TIP / (gap / 3600000.0);
 }
 
 // ---- Time helpers ----
@@ -586,7 +599,7 @@ boolean publish_state()
     return false;
   DynamicJsonDocument doc(384);
   doc["rain"] = round(total_rain_mm * 100) / 100.0;
-  doc["rate"] = round(last_rate * 10) / 10.0;
+  doc["rate"] = round(rain_rate_mm_h() * 10) / 10.0;
   doc["raining"] = raining_now();
   doc["rssi"] = WiFi.RSSI();
   doc["uptime"] = millis() / 1000UL;
@@ -953,7 +966,7 @@ void handle_root()
            "</div>",
            rain ? "rn" : "dr",
            rain ? "Raining now" : "Not raining",
-           last_rate);
+           rain_rate_mm_h());
   server.sendContent(status);
 
   // ---- Overview: 2×2 precipitation cards, each with an inline sparkline ----
@@ -1025,12 +1038,12 @@ void handle_reset_rain()
 {
   // Zero every accumulated rainfall value (used to clear bogus test data).
   noInterrupts();
-  tipping_count = 0; // drop any pending unconsumed tips
+  tipping_count = 0;     // drop any pending unconsumed tips
+  last_tip_time = 0;     // so raining_now() and the rate go back to 0
+  last_tip_interval = 0;
   interrupts();
 
   total_rain_mm = 0.0;
-  period_rain_mm = 0.0;
-  last_rate = 0.0;
   rain_today_mm = 0.0;
   rain_week_mm = 0.0;
   rain_month_mm = 0.0;
@@ -1148,7 +1161,6 @@ void loop()
     consume_tips(tips);
     float mm = tips * MM_PER_TIP;
     total_rain_mm += mm;
-    period_rain_mm += mm;
     rain_today_mm += mm;
     rain_week_mm += mm;
     rain_month_mm += mm;
@@ -1184,13 +1196,7 @@ void loop()
 
   if (millis() - last_send_rain > interval_ms)
   {
-    unsigned long elapsed_ms = millis() - last_send_rain;
-    if (elapsed_ms > 0)
-      last_rate = (period_rain_mm / (elapsed_ms / 1000.0)) * 3600.0;
     if (publish_state())
-    {
-      period_rain_mm = 0.0;
       last_send_rain = millis();
-    }
   }
 }
